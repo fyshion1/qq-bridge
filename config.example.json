@@ -1,0 +1,73 @@
+{
+  "brain": {
+    "base_url": "http://127.0.0.1:8000"
+  },
+  "onebot": {
+    "mode": "server",
+    "listen_host": "127.0.0.1",
+    "listen_port": 3001,
+    "listen_path": "/onebot/v11/ws",
+    "ws_url": "ws://127.0.0.1:3001",
+    "access_token": "",
+    "self_id": "",
+    "reconnect_seconds": 5
+  },
+  "allow": {
+    "groups": [],
+    "private": [],
+    "require_mention_in_group": true,
+    "ignore_bots": true
+  },
+  "persona": {
+    "character_id": ""
+  },
+  "owner": {
+    "qq": "",
+    "admin_commands": true,
+    "whitelist_bypass": true
+  },
+  "sync": {
+    "to_frontend": true,
+    "persona_id": "",
+    "prefix_remote": true
+  },
+  "reply": {
+    "chunk_chars": 400,
+    "mention_sender_in_group": true
+  },
+  "media": {
+    "video_frames": 4,
+    "treat_small_image_as_sticker": false
+  },
+  "voice": {
+    "enabled": true,
+    "engine": "edge",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "auto": "mirror",
+    "max_chars": 80,
+    "max_per_minute": 3
+  },
+  "asr": {
+    "enabled": true,
+    "engine": "none",
+    "base_url": "",
+    "api_key": "",
+    "model": "whisper-1",
+    "language": "zh",
+    "max_seconds": 120
+  },
+  "sticker": {
+    "enabled": true,
+    "auto_collect": true,
+    "reply_chance": 0.0
+  },
+  "memory": {
+    "enabled": true,
+    "isolate": false,
+    "window": 24
+  },
+  "modes": {
+    "dm": "chat",
+    "group": "chat"
+  }
+}
