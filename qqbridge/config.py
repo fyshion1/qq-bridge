@@ -29,9 +29,11 @@ DEFAULT: dict = {
         "base_url": "http://127.0.0.1:8000",
     },
     "onebot": {
-        # 两种连法（SnowLuma / NapCat / Lagrange 都是 OneBot v11 这一套）：
+        # 两种连法（NapCat 为首选；SnowLuma / Lagrange 等同为 OneBot v11 这一套）：
         #   server = 反向 WS：我们监听端口，网关配「反向 WS 地址」指过来（**推荐**）
         #   client = 正向 WS：我们主动连 ws_url
+        # ⚠ 3001 是**本桥**的端口。NapCat 自带的 WS 服务器默认也爱占 3000/3001 ——
+        #   撞了就把这里改成 3002，网关那边跟着改。多号依次排开，别重。
         "mode": "server",
         "listen_host": "127.0.0.1",
         "listen_port": 3001,

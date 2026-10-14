@@ -1,6 +1,6 @@
 """OneBot v11 接入层：**只做协议，不做业务**。
 
-QQ 那边由网关负责（参考项目用的是 SnowLuma / Lagrange 系，NapCat 同理）——
+QQ 那边由网关负责（**NapCat** 为首选，SnowLuma / Lagrange 等同为 OneBot v11 系）——
 网关把 QQ 的收发翻译成 OneBot v11 的**事件**和**动作**，我们两头都不碰协议细节：
 
     网关 ──事件──▶ 我们（reverse WS 服务端，网关主动连过来）
