@@ -3,15 +3,16 @@
     "base_url": "http://127.0.0.1:8000"
   },
   "onebot": {
-    "mode": "server",
+    "mode": "client",
     "listen_host": "127.0.0.1",
-    "listen_port": 3001,
+    "listen_port": 3010,
     "listen_path": "/onebot/v11/ws",
-    "ws_url": "ws://127.0.0.1:3001",
+    "ws_url": "ws://127.0.0.1:3001/",
     "access_token": "",
     "self_id": "",
     "reconnect_seconds": 5
   },
+  "accounts": [],
   "allow": {
     "groups": [],
     "private": [],
@@ -24,7 +25,8 @@
   "owner": {
     "qq": "",
     "admin_commands": true,
-    "whitelist_bypass": true
+    "whitelist_bypass": true,
+    "tools": null
   },
   "sync": {
     "to_frontend": true,
@@ -49,7 +51,7 @@
   },
   "asr": {
     "enabled": true,
-    "engine": "none",
+    "engine": "qq",
     "base_url": "",
     "api_key": "",
     "model": "whisper-1",
@@ -59,12 +61,31 @@
   "sticker": {
     "enabled": true,
     "auto_collect": true,
-    "reply_chance": 0.0
+    "reply_chance": 0.0,
+    "library": [],
+    "library_session": "single-dalaoda"
   },
   "memory": {
     "enabled": true,
     "isolate": false,
     "window": 24
+  },
+  "tools": {
+    "enabled": false,
+    "root": "",
+    "allow": [
+      "dir",
+      "read",
+      "find",
+      "info"
+    ],
+    "max_bytes": 8000,
+    "require_owner": true,
+    "max_turns": 3
+  },
+  "events": {
+    "poke": true,
+    "notice": false
   },
   "modes": {
     "dm": "chat",

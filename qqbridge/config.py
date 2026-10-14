@@ -29,16 +29,16 @@ DEFAULT: dict = {
         "base_url": "http://127.0.0.1:8000",
     },
     "onebot": {
-        # 两种连法（NapCat 为首选；SnowLuma / Lagrange 等同为 OneBot v11 这一套）：
-        #   server = 反向 WS：我们监听端口，网关配「反向 WS 地址」指过来（**推荐**）
-        #   client = 正向 WS：我们主动连 ws_url
-        # ⚠ 3001 是**本桥**的端口。NapCat 自带的 WS 服务器默认也爱占 3000/3001 ——
-        #   撞了就把这里改成 3002，网关那边跟着改。多号依次排开，别重。
-        "mode": "server",
+        # 两种连法（SnowLuma 为首选，本机正在用它；NapCat / Lagrange 同为 OneBot v11 这一套）：
+        #   client = 正向 WS：我们主动连 ws_url（**默认** —— 网关那边什么都不用配、不用重启）
+        #   server = 反向 WS：我们监听端口，网关配「反向 WS 地址」指过来
+        # ⚠ 3010 是**本桥**的端口，故意避开 3000/3001 —— 那是 SnowLuma（以及 NapCat）
+        #   默认占的 WS/HTTP 口，撞上就是「网关连不上」。多号依次排开，别重。
+        "mode": "client",
         "listen_host": "127.0.0.1",
-        "listen_port": 3001,
+        "listen_port": 3010,
         "listen_path": "/onebot/v11/ws",
-        "ws_url": "ws://127.0.0.1:3001",   # mode=client 时才用
+        "ws_url": "ws://127.0.0.1:3001/",   # mode=client 时才用（正向：我们连网关）
         "access_token": "",
         "self_id": "",          # 留空 = 连上后问网关要（get_login_info）
         "reconnect_seconds": 5,
@@ -215,9 +215,20 @@ REMOTE: dict = {}
 
 
 def apply_remote(cfg: dict, remote: dict | None = None) -> dict:
-    """把前端设置铺到配置上。**只认 REMOTE_KEYS 里登记过的 key**，其余忽略。"""
+    """把前端设置铺到配置上。**只认 REMOTE_KEYS 里登记过的 key + `accounts`**，其余忽略。
+
+    `accounts` 特殊：它不是「一个路径上一个值」，而是**整份账号表**（一个 QQ 号一行）。
+    大老大要的就是「哪个号演谁在前端切换」——所以这里整表替换，不是逐字段合并。
+    空表 = 没在前端配过多账号，保持本地 `config.json` 里那份（单账号或多账号都行）。
+    """
     out = cfg
-    for key, value in (REMOTE if remote is None else remote).items():
+    src = REMOTE if remote is None else remote
+    for key, value in src.items():
+        if str(key) == "accounts":
+            # 前端存过（非空）才覆盖；空表不动本地那份，免得「一打开前端就把号清空」。
+            if isinstance(value, list) and value:
+                out["accounts"] = value
+            continue
         path = REMOTE_KEYS.get(str(key))
         if not path:
             continue
@@ -249,7 +260,7 @@ def accounts(cfg: dict | None = None) -> list[dict]:
     三种情形：
     - `accounts` 里有启用的行 → 每行一个号（一份配置带多个号，各连各的网关端口）；
     - 没有 → 回落到「单账号」：一条，字段来自 `onebot.*` / `persona.*` / `allow.*`；
-    - 某号没写 `groups` / `private` → `None`，由调用方回落到顶层白名单。
+    - 某号没写 `groups` / `private` / `ws_url` → `None`，由调用方回落到顶层那份。
     """
     cfg = cfg if cfg is not None else load()
     rows = [row for row in (cfg.get("accounts") or []) if isinstance(row, dict) and row.get("enabled", True)]
@@ -257,18 +268,21 @@ def accounts(cfg: dict | None = None) -> list[dict]:
         return [{
             "name": "默认", "self_id": str((cfg.get("onebot") or {}).get("self_id") or ""),
             "persona": "", "listen_port": None, "access_token": None,
-            "groups": None, "private": None,
+            "ws_url": None, "groups": None, "private": None,
         }]
-    base_port = int((cfg.get("onebot") or {}).get("listen_port") or 3001)
+    base_port = int((cfg.get("onebot") or {}).get("listen_port") or 3010)
     out: list[dict] = []
     for index, row in enumerate(rows):
         out.append({
             "name": str(row.get("name") or f"号{index + 1}"),
             "self_id": str(row.get("self_id") or ""),
             "persona": str(row.get("persona") or ""),
-            # 没写端口就依次排开（3001 / 3002 …）—— 反向 WS 每个号必须占一个端口。
+            # 没写端口就依次排开（3010 / 3011 …）—— 反向 WS 每个号必须占一个端口。
             "listen_port": int(row["listen_port"]) if row.get("listen_port") else base_port + index,
             "access_token": row.get("access_token"),   # None = 用顶层那个
+            # 正向 WS（桥主动连网关）时，**每个号连自己的那个 ws 服务端**——
+            # SnowLuma 是「一个 QQ 号一个 ws server 端口」，所以这里也得一个号一个地址。
+            "ws_url": str(row.get("ws_url") or "").strip() or None,
             "groups": row.get("groups"),               # None = 用顶层白名单
             "private": row.get("private"),
         })

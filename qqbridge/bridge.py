@@ -113,14 +113,18 @@ class AccountRunner:
     # ---- 账号 → 这份连接用的配置 ----
 
     def _client_cfg(self, cfg: dict) -> dict:
-        """把「这个号的」端口 / token / self_id 铺到通用配置上，给 OneBotClient 用。
+        """把「这个号的」端口 / token / self_id / 网关地址铺到通用配置上。
 
-        反向 WS 每个号必须占一个不同端口（网关那边也是按端口配的）。
+        - 反向 WS（`mode=server`）：每个号必须占一个**不同端口**，网关那边也按端口配；
+        - 正向 WS（`mode=client`）：每个号要连**自己的那个网关地址**——
+          SnowLuma 是「一个 QQ 号一个 ws server 端口」，所以 `ws_url` 也得一号一份。
         """
         out = json.loads(json.dumps(cfg))
         ob = out.setdefault("onebot", {})
         if self.account.get("listen_port"):
             ob["listen_port"] = int(self.account["listen_port"])
+        if self.account.get("ws_url"):
+            ob["ws_url"] = str(self.account["ws_url"])
         if self.account.get("access_token") is not None:
             ob["access_token"] = self.account.get("access_token") or ""
         if self.account.get("self_id"):
