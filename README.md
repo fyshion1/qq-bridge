@@ -322,7 +322,7 @@ python tools/fake_onebot.py --listen              # 常驻：终端里打字当�
 | | `library` | `[]` | 表情包库（**本体附件库的引用**，不另存副本） |
 | `memory` | `isolate` / `window` | `false` / `24` | 记忆隔离 / 攒多少条提一次 |
 | `tools` | `enabled` | `false` | **本地小工具**：默认关；开了也只在划定的目录里跑只读动作 |
-| | `root` / `allow` / `max_bytes` | `data/sandbox/` / dir,type,find,echo,cat / 8000 | 只许碰哪个目录 / 允许哪些动作 / 单次读多少字 |
+| | `root` / `allow` / `max_bytes` | `data/sandbox/` / dir,read,find,info / 8000 | 只许碰哪个目录 / 允许哪些动作 / 单次读多少字 |
 | | `require_owner` / `max_turns` | `true` / `3` | 只有大老大能触发 / 一轮最多来回几次 |
 | `events` | `poke` / `notice` | `true` / `false` | 被戳一戳回一句（同一人 30 秒只理一次）/ 群成员变动记一笔 |
 | `modes` | `dm` / `group` | `chat` | `silent` = 只同步不开口 |
@@ -360,6 +360,35 @@ python tools/fake_onebot.py --listen              # 常驻：终端里打字当�
 
 ---
 
+## 改 QQ 个人资料（已验证）
+
+QQ 号自己的昵称 / 签名 / 性别 / 头像，走网关的 OneBot 动作就能改 —— **桥不存这些，也不替小糖人
+决定写什么**，这里记的是「怎么改」和「哪几个字段真能改」。
+
+| 动作 | 参数 | 本机实测 |
+|---|---|---|
+| `set_self_longnick` | `longNick`（**严格 string**） | ✅ 成功。签名立刻生效 |
+| `set_qq_profile` | `nickname` / `personal_note` / `sex`（0 未知 1 男 2 女） | ✅ 只传单个字段也成功 |
+| `set_qq_avatar` | `file`（图片，路径或 URL） | 未测 |
+| `set_diy_online_status` | `face_id` / `wording` / `face_type` | 未测 |
+
+已改的：553350415（芳月诗音）签名 → `小糖人之家的大姐头 · 烤小饼干、泡热可可`。
+
+**两个坑，都踩过**：
+
+1. **`personal_note` 和签名是同一个东西** —— 一起传会 `OIDB error 999 ... set longnick Fail`。
+   所以：**要改签名就用 `set_self_longnick`，别混在 `set_qq_profile` 里**；
+   `set_qq_profile` 只用来改昵称和性别（本机验证：单独传能成）。
+2. **中文要从文件发** —— Windows 终端直接 `curl -d '{"longNick":"中文"}'` 会被 GBK 折成乱码存进去
+   （看回读的 `long_nick` 是一串 `С`）。用 `--data-binary @payload.json`、
+   `Content-Type: application/json; charset=utf-8`，payload 文件按 utf-8 写。桥里发中文本来就走
+   `json.dumps(..., ensure_ascii=False)` + utf-8 编码，不会有这问题。
+
+回读用 `get_stranger_info`（带自己的 `user_id`）—— `get_profile` / `get_self_longnick` 这类
+**SnowLuma 没有**（回 `1404 unknown action`）。这里能读到 `nickname` / `long_nick` / `sex`。
+
+---
+
 ## 安全边界（有意为之，别改松）
 
 - **白名单为空 = 谁都不理**。不做「默认全接」。
@@ -381,7 +410,7 @@ python tools/fake_onebot.py --listen              # 常驻：终端里打字当�
 python -m unittest discover -s tests -v
 ```
 
-23 个纯离线用例（不连真 QQ、不连大脑），重点压三件最容易出事又最难肉眼发现的事：
+49 个纯离线用例（不连真 QQ、不连大脑），重点压三件最容易出事又最难肉眼发现的事：
 **白名单**、**同步 vs 开口**、**重放去重**。
 
 ---

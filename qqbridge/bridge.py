@@ -206,7 +206,7 @@ class AccountRunner:
         prefix = self._prefix(event)
         self.log(f"[{self.label()}] ← {event.session_key} {event.display_name}："
                  f"{(text or '（只有媒体）')[:40]}")
-        self._sync_inbound(session_id, prefix, text, media_items)
+        await self._sync_inbound(session_id, prefix, text, media_items)
         self.router.remember(event.session_key, route.session_kind, route.character_id,
                              self._speaker(event), text or "[发了点东西]")
         if not route.reply:
@@ -565,8 +565,8 @@ class AccountRunner:
             reply = random.choice(["呀，被你戳到了～", "在的在的，怎么啦？", "（被戳）诶？"])
             self.log(f"[{self.label()}] 👉 被戳了（{notice.user_id}）")
             await self._send(fake, reply, force_text=True)
-            self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
-                               self._prefix(fake), "（被戳了一下）", [])
+            await self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
+                                     self._prefix(fake), "（被戳了一下）", [])
             return
         if not events_cfg.get("notice", False):
             return
@@ -574,8 +574,8 @@ class AccountRunner:
         if notice.is_group and notice.group_id not in self.router._groups():
             return
         self.log(f"[{self.label()}] 📝 {notice.describe()}")
-        self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
-                           "", notice.describe(), [])
+        await self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
+                                 "", notice.describe(), [])
 
     # ---- 同步进前端 ----
 
