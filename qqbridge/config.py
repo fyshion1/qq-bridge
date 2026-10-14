@@ -4,6 +4,13 @@
 - **默认关**。没配 `allow.groups` / `allow.private` 就是「谁都不理」—— 宁可不动，不可乱动。
 - **默认安静**。群里默认要 @ 才回；语音默认只在对方先发语音时回语音（避免开口吓人）。
 - 改完不用重启：`bridge.py` 每轮前重新读一次（文件很小，省得搞热重载那套）。
+
+**两处可改，前端说了算**（§9.6.5）：
+- `config.json` —— 本地文件，适合「我就要这么写死」或没起大脑时兜底；
+- 小窝前端「💬 QQ 桥设置」—— 存本体（`/api/nest/features/qq_bridge/settings`），
+  **优先级更高**，每轮刷新，改完就生效。大老大原话：「这块希望在前端可以自己配置」。
+
+合并顺序：`DEFAULT` → `config.json` → 前端设置（`REMOTE`，见 settings.py）。
 """
 
 from __future__ import annotations
@@ -34,6 +41,10 @@ DEFAULT: dict = {
         "self_id": "",          # 留空 = 连上后问网关要（get_login_info）
         "reconnect_seconds": 5,
     },
+    # **多个 QQ 号**（大老大：「我 QQ 号一堆，可以每个都配一个」）：
+    # 一个账号 = 一个小糖人 = 一份 {self_id, persona, 端口, 白名单}。
+    # 空列表 = 单账号模式，用下面 onebot.* / persona.* / allow.*。
+    "accounts": [],
     "allow": {
         # 空 = 谁都不理。真要用必须显式填，防「刚装好就被拉进陌生群」。
         "groups": [],
@@ -43,13 +54,15 @@ DEFAULT: dict = {
     },
     "persona": {
         # 这个 QQ 号演谁。留空 = 名册第一个人（会提醒你一次）。
-        # **一个账号 = 一个小糖人**：想让几个小糖人都在 QQ 上，就跑几份、各配各的。
+        # **一个账号 = 一个小糖人**：想几个小糖人都在 QQ 上，就配多条 `accounts`
+        # （一份配置带多个号），或者把这个项目跑几份、各配各的 config.json。
         "character_id": "",
     },
     "owner": {
         "qq": "",                # 管理员 QQ。留空 = 没有管理员（管理命令全禁用）
         "admin_commands": True,  # /reset /silent /active 这类（**桥接硬执行**，不过模型）
         "whitelist_bypass": True,  # 管理员私聊不受 allow.private 限制
+        "tools": None,           # None = 跟 tools.require_owner 走
     },
     "sync": {
         "to_frontend": True,     # QQ 里聊的同步进前端聊天记录（群聊 → group，私聊 → single-<角色>）
@@ -75,7 +88,11 @@ DEFAULT: dict = {
     },
     "asr": {
         "enabled": True,
-        "engine": "none",        # none / openai（OpenAI 兼容 /audio/transcriptions）
+        # qq     = 用**QQ 自己的转写**（手机上那个「转文字」，网关一般挂在 record 段里）—— 默认；
+        # openai = QQ 没给转写时再用外部 whisper 兜一层（要花钱、音频过上游）；
+        # none   = 不识别，收到就记 [语音]。
+        # 大老大批注：「ASR 用 QQ 的，按项目的来，qq 有转写的」。
+        "engine": "qq",
         "base_url": "",          # 留空 = 用大脑给这个功能配的 base_url
         "api_key": "",           # 留空 = 用大脑那份 key（不落盘到别处）
         "model": "whisper-1",
@@ -84,18 +101,88 @@ DEFAULT: dict = {
     },
     "sticker": {
         "enabled": True,
-        "auto_collect": True,    # 收到别人的表情就学下来（本地库，不外传）
-        "reply_chance": 0.0,     # 0 = 只在被明确要求时表情包回复（默认不主动刷屏）
+        "auto_collect": True,    # 收到别人的表情就学下来
+        # 0 = 不主动发（只在你点名要的时候发）。大老大喜欢小糖人的表情包，可往上调。
+        "reply_chance": 0.0,
+        # 表情包**存在大脑的附件库里**（前端显示、删消息级联、存储管理都跟着走），
+        # 这里只是一份索引：一串 `/api/files/<会话>/orig/<hash>.<ext>` 引用。
+        "library": [],
+        "library_session": "single-dalaoda",
     },
     "memory": {
         "enabled": True,
         "isolate": False,        # False = 汇入普通记忆（大老大批注：QQ 聊的日常也记得）
         "window": 24,            # 攒够多少条提一次
     },
+    # 本地小工具（大老大：「不碰本地工具的话，我倒是希望他能碰一下，只要别搞坏东西」）。
+    # 默认**关**。开了之后：只在 root 里活动 + 只跑登记表里的动作 + 危险操作永久拒绝。
+    # ⚠ `allow` 里只能写 `tools.ACTIONS` 里有的名字（dir / read / find / info）——
+    #    配置只能从登记表里**挑**，加不进新动作（写了个不存在的名字就是没这一项）。
+    "tools": {
+        "enabled": False,
+        "root": "",              # 留空 = data/sandbox/（第一次开的时候自动建）
+        "allow": ["dir", "read", "find", "info"],
+        "max_bytes": 8000,       # 单次读多少字（截断，免得烧 token）
+        "require_owner": True,   # 只有大老大的消息能触发
+        "max_turns": 3,          # 一轮里最多来回几次（防模型钻牛角尖）
+    },
+    # 事件（大老大：「都想要」）—— 戳一戳 / 群成员变动 / 撤回。
+    "events": {
+        "poke": True,            # 被戳一戳回一句（同一人 30 秒内只理一次，不刷屏）
+        "notice": False,         # 群成员变动 / 撤回 → 同步一条记录进小窝（不开口）
+    },
     "modes": {
         "dm": "chat",            # chat / silent
         "group": "chat",
     },
+}
+
+# 前端设置里的 key（`feature_settings` 表）→ 本地配置的路径。
+# 登记表就是**白名单**：不在表里的 key 一律忽略，免得前端顺手改了别的项。
+REMOTE_KEYS: dict[str, tuple[str, ...]] = {
+    "persona.character_id": ("persona", "character_id"),
+    "onebot.self_id": ("onebot", "self_id"),
+    "onebot.mode": ("onebot", "mode"),
+    "onebot.listen_port": ("onebot", "listen_port"),
+    "onebot.listen_path": ("onebot", "listen_path"),
+    "onebot.ws_url": ("onebot", "ws_url"),
+    "onebot.access_token": ("onebot", "access_token"),
+    "allow.groups": ("allow", "groups"),
+    "allow.private": ("allow", "private"),
+    "allow.require_mention_in_group": ("allow", "require_mention_in_group"),
+    "allow.ignore_bots": ("allow", "ignore_bots"),
+    "owner.qq": ("owner", "qq"),
+    "owner.admin_commands": ("owner", "admin_commands"),
+    "owner.tools": ("owner", "tools"),
+    "voice.enabled": ("voice", "enabled"),
+    "voice.engine": ("voice", "engine"),
+    "voice.voice": ("voice", "voice"),
+    "voice.auto": ("voice", "auto"),
+    "voice.max_chars": ("voice", "max_chars"),
+    "voice.max_per_minute": ("voice", "max_per_minute"),
+    "asr.engine": ("asr", "engine"),
+    "asr.base_url": ("asr", "base_url"),
+    "asr.api_key": ("asr", "api_key"),
+    "asr.model": ("asr", "model"),
+    "sticker.enabled": ("sticker", "enabled"),
+    "sticker.reply_chance": ("sticker", "reply_chance"),
+    "sticker.auto_collect": ("sticker", "auto_collect"),
+    "sticker.treat_small_image_as_sticker": ("media", "treat_small_image_as_sticker"),
+    "sticker.library": ("sticker", "library"),
+    "sticker.library_session": ("sticker", "library_session"),
+    "tools.enabled": ("tools", "enabled"),
+    "tools.root": ("tools", "root"),
+    "tools.allow": ("tools", "allow"),
+    "tools.max_bytes": ("tools", "max_bytes"),
+    "tools.require_owner": ("tools", "require_owner"),
+    "sync.to_frontend": ("sync", "to_frontend"),
+    "sync.persona_id": ("sync", "persona_id"),
+    "memory.isolate": ("memory", "isolate"),
+    "events.poke": ("events", "poke"),
+    "events.notice": ("events", "notice"),
+    "media.video_frames": ("media", "video_frames"),
+    "modes.group": ("modes", "group"),
+    "modes.dm": ("modes", "dm"),
 }
 
 
@@ -110,7 +197,8 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
-def load(path: Path = CONFIG_PATH) -> dict:
+def load_raw(path: Path = CONFIG_PATH) -> dict:
+    """只读本地那两份（DEFAULT + config.json），不含前端设置。"""
     if not path.is_file():
         return json.loads(json.dumps(DEFAULT))
     try:
@@ -118,6 +206,71 @@ def load(path: Path = CONFIG_PATH) -> dict:
     except (json.JSONDecodeError, OSError):
         return json.loads(json.dumps(DEFAULT))
     return _merge(DEFAULT, raw if isinstance(raw, dict) else {})
+
+
+# 前端设置那一份（`settings.pull()` 拉到之后填进来）。改完不用重启 —— 每轮重新合并。
+REMOTE: dict = {}
+
+
+def apply_remote(cfg: dict, remote: dict | None = None) -> dict:
+    """把前端设置铺到配置上。**只认 REMOTE_KEYS 里登记过的 key**，其余忽略。"""
+    out = cfg
+    for key, value in (REMOTE if remote is None else remote).items():
+        path = REMOTE_KEYS.get(str(key))
+        if not path:
+            continue
+        node = out
+        for step in path[:-1]:
+            nxt = node.get(step)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[step] = nxt
+            node = nxt
+        node[path[-1]] = value
+    return out
+
+
+def set_remote(remote: dict) -> None:
+    """进程里存一份前端设置（`settings.pull()` 拉到之后调）。"""
+    global REMOTE
+    REMOTE = dict(remote or {})
+
+
+def load(path: Path = CONFIG_PATH) -> dict:
+    """生效配置 = 默认 → config.json → 前端设置。改完下一轮就读到，不用重启。"""
+    return apply_remote(load_raw(path))
+
+
+def accounts(cfg: dict | None = None) -> list[dict]:
+    """**这份配置要连几个 QQ 号**，每个演谁。
+
+    三种情形：
+    - `accounts` 里有启用的行 → 每行一个号（一份配置带多个号，各连各的网关端口）；
+    - 没有 → 回落到「单账号」：一条，字段来自 `onebot.*` / `persona.*` / `allow.*`；
+    - 某号没写 `groups` / `private` → `None`，由调用方回落到顶层白名单。
+    """
+    cfg = cfg if cfg is not None else load()
+    rows = [row for row in (cfg.get("accounts") or []) if isinstance(row, dict) and row.get("enabled", True)]
+    if not rows:
+        return [{
+            "name": "默认", "self_id": str((cfg.get("onebot") or {}).get("self_id") or ""),
+            "persona": "", "listen_port": None, "access_token": None,
+            "groups": None, "private": None,
+        }]
+    base_port = int((cfg.get("onebot") or {}).get("listen_port") or 3001)
+    out: list[dict] = []
+    for index, row in enumerate(rows):
+        out.append({
+            "name": str(row.get("name") or f"号{index + 1}"),
+            "self_id": str(row.get("self_id") or ""),
+            "persona": str(row.get("persona") or ""),
+            # 没写端口就依次排开（3001 / 3002 …）—— 反向 WS 每个号必须占一个端口。
+            "listen_port": int(row["listen_port"]) if row.get("listen_port") else base_port + index,
+            "access_token": row.get("access_token"),   # None = 用顶层那个
+            "groups": row.get("groups"),               # None = 用顶层白名单
+            "private": row.get("private"),
+        })
+    return out
 
 
 def write_example(path: Path = EXAMPLE_PATH) -> Path:

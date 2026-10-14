@@ -187,6 +187,27 @@ def _frame_to_path(frame_url: str) -> Path | None:
     return path if path.is_file() else None
 
 
+def local_from_url(url: str) -> Path | None:
+    """`/api/files/<会话>/orig/<文件>` → 本地路径（本体就在同一台机器上，直接读盘就行）。
+
+    为什么不用 HTTP 再下一次：同一台机器、同一个文件，绕一圈 HTTP 只是多一层会出错的地方
+    （`/api/files` 是静态目录挂载，没有鉴权，也没必要）。
+    越界防护：拼出来的路径必须仍在附件目录里 —— 和本体的 `attachments._resolve_local` 同一套规则。
+    """
+    parts = [p for p in str(url or "").split("/") if p]
+    if len(parts) < 5 or parts[0] != "api" or parts[1] != "files":
+        return None
+    backend_root = Path(__file__).resolve().parent.parent.parent.parent / "backend"
+    root = (backend_root / "data" / "attachments").resolve()
+    try:
+        path = (root.joinpath(*parts[2:])).resolve()
+    except (OSError, ValueError):
+        return None
+    if root != path and root not in path.parents:
+        return None
+    return path if path.is_file() else None
+
+
 # ---- 语音 ----
 
 def prepare_audio(path: Path) -> tuple[Path, bool]:

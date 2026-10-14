@@ -96,6 +96,19 @@ class BrainClient:
         except BrainError:
             return []
 
+    def settings(self) -> dict:
+        """大老大在**小窝前端**改的那些设置（§9.6.5）—— 值存大脑，这里拉回来覆盖 config.json。
+
+        拉不到（大脑没起 / 这个功能没声明 settings）就返回空表：桥照常用自己的 config.json。
+        这是**故意的单向依赖**：没有大脑时桥照样能跑，只是少了一份前端配置。
+        """
+        try:
+            got = self._request(f"/api/nest/features/{FEATURE_ID}/settings") or {}
+        except BrainError:
+            return {}
+        values = got.get("values")
+        return values if isinstance(values, dict) else {}
+
     def chat(
         self,
         character_id: str,
@@ -127,6 +140,39 @@ class BrainClient:
         if images:
             payload["images"] = list(images)
         return self._request("/api/nest/chat", payload)
+
+    # ---- 带工具的一轮（§9.6.6）----
+
+    def tool_turn(
+        self,
+        character_id: str,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        state: dict | None = None,
+        conversation_id: str = "",
+        max_tokens: int = 1024,
+    ) -> dict:
+        """问一次模型（带工具声明），拿回它的决定 —— **大脑不执行任何工具**。
+
+        返回 `{content, tool_calls: [{id, name, arguments}], finish_reason}`。
+        `arguments` 是模型给的**原始 JSON 字符串**，解析 + 白名单 + 沙箱都在本项目这边
+        （`tools.py`）。也就是说：大脑只是个「会说工具话」的模型客户端，
+        真正的动作权限从来没离开过这台机器上的这个进程。
+        """
+        payload = {
+            "feature_id": FEATURE_ID,
+            "character_id": character_id,
+            "conversation_id": conversation_id,
+            "messages": messages,
+            "state": state or {},
+            "tools": list(tools or []),
+            "max_tokens": max_tokens,
+        }
+        if images:
+            payload["images"] = list(images)
+        return self._request("/api/nest/tool-turn", payload)
 
     # ---- 同步进前端的会话记录（§15 的 /api/messages）----
 

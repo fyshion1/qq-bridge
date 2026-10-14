@@ -31,6 +31,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 Handler = Callable[["Event"], Awaitable[None]]
+NoticeHandler = Callable[["Notice"], Awaitable[None]]
 
 
 class OneBotError(RuntimeError):
@@ -186,6 +187,105 @@ def seg_record_file(path: str) -> dict:
     return {"type": "record", "data": {"file": Path(path).resolve().as_posix()}}
 
 
+def seg_at(user_id: str) -> dict:
+    """@ 某人（群里回话时用）。"""
+    return {"type": "at", "data": {"qq": str(user_id)}}
+
+
+def text_of_record(seg: dict) -> str:
+    """语音段里**网关顺手给的转写**（就是手机上那个「转文字」）。
+
+    各家网关字段名不一：NapCat/Lagrange 系常见 `text`，也有塞在 `summary` 里的。
+    有就用 —— 这就是大老大说的「ASR 用 QQ 的，qq 有转写的」。
+    """
+    data = (seg or {}).get("data") or {}
+    for key in ("text", "transcription", "summary", "trans"):
+        value = str(data.get(key) or "").strip()
+        # 有些网关没有转写时会把文件名 / "[语音]" 塞进 summary，那些不算转写。
+        if value and not value.startswith("[") and value not in {"语音", "voice"}:
+            return value
+    return ""
+
+
+# ---- 通知事件（戳一戳 / 群成员变动 / 撤回）----
+#
+# 参考项目接了 poke，我们**默认也接**（大老大批注「都想要」），但加了防刷屏：
+# 同一个人在 30 秒内戳它只理一次 —— 不然有人连点几下就是一片回复。
+
+
+@dataclass
+class Notice:
+    """一条通知事件（规整过的）。"""
+
+    kind: str                      # poke | group_increase | group_decrease | recall | other
+    sub_type: str = ""
+    group_id: str = ""
+    user_id: str = ""              # 触发者（谁戳的 / 谁进群）
+    target_id: str = ""            # 被戳的 / 被操作的
+    operator_id: str = ""
+    message_id: str = ""
+    self_id: str = ""
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def is_group(self) -> bool:
+        return bool(self.group_id)
+
+    @property
+    def session_key(self) -> str:
+        return f"{'g' if self.is_group else 'p'}:{self.group_id or self.user_id}"
+
+    def describe(self) -> str:
+        """给人看的一句话（同步进小窝时用，别让它开口）。"""
+        who = self.user_id or "有人"
+        if self.kind == "poke":
+            return f"{who} 戳了戳我"
+        if self.kind == "group_increase":
+            return f"{who} 进群了"
+        if self.kind == "group_decrease":
+            return f"{who} 退群了（{self.sub_type or 'leave'}）"
+        if self.kind == "recall":
+            return f"{who} 撤回了一条消息"
+        return f"一条 {self.kind} 通知"
+
+
+def parse_notice(payload: dict, self_id: str = "") -> Notice | None:
+    """OneBot 通知事件 → Notice；不是我们关心的一类就返回 None。
+
+    只认：戳一戳（notify/poke）、群成员增减、消息撤回。其余 notice 一律不管 ——
+    少一类事件就少一处会莫名其妙自己动起来的地方。
+    """
+    if (payload or {}).get("post_type") != "notice":
+        return None
+    notice_type = str(payload.get("notice_type") or "")
+    sub_type = str(payload.get("sub_type") or "")
+    if notice_type == "notify":
+        if sub_type != "poke":
+            return None
+        return Notice(kind="poke", sub_type=sub_type,
+                      group_id=str(payload.get("group_id") or ""),
+                      user_id=str(payload.get("user_id") or ""),
+                      target_id=str(payload.get("target_id") or ""),
+                      self_id=str(payload.get("self_id") or self_id or ""),
+                      raw=payload)
+    if notice_type in ("group_increase", "group_decrease"):
+        return Notice(kind=notice_type, sub_type=sub_type,
+                      group_id=str(payload.get("group_id") or ""),
+                      user_id=str(payload.get("user_id") or ""),
+                      operator_id=str(payload.get("operator_id") or ""),
+                      self_id=str(payload.get("self_id") or self_id or ""),
+                      raw=payload)
+    if notice_type == "group_recall":
+        return Notice(kind="recall", sub_type=sub_type,
+                      group_id=str(payload.get("group_id") or ""),
+                      user_id=str(payload.get("user_id") or ""),
+                      operator_id=str(payload.get("operator_id") or ""),
+                      message_id=str(payload.get("message_id") or ""),
+                      self_id=str(payload.get("self_id") or self_id or ""),
+                      raw=payload)
+    return None
+
+
 def split_text(text: str, limit: int = 400) -> list[str]:
     """超长回复切成几条发（QQ 单条正文有上限，且长消息看起来像刷屏）。
 
@@ -217,7 +317,7 @@ class OneBotClient:
     重启一次就得让人手动点一遍。
     """
 
-    def __init__(self, cfg: dict, on_event: Handler, logger=print):
+    def __init__(self, cfg: dict, on_event: Handler, logger=print, on_notice: NoticeHandler | None = None):
         ob = (cfg or {}).get("onebot") or {}
         self.mode = str(ob.get("mode") or "server")
         self.ws_url = str(ob.get("ws_url") or "")
@@ -228,6 +328,7 @@ class OneBotClient:
         self.self_id = str(ob.get("self_id") or "")
         self.reconnect_seconds = int(ob.get("reconnect_seconds") or 5)
         self.on_event = on_event
+        self.on_notice = on_notice
         self.log = logger
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}
@@ -393,6 +494,17 @@ class OneBotClient:
                 future.set_result(payload)
             return
         if payload.get("post_type") == "meta_event":
+            return
+        if payload.get("post_type") == "notice":
+            # 通知事件（戳一戳 / 群成员变动 / 撤回）走另一条回调 —— 它们不该被当成
+            # 「有人跟我说话」，处理方式完全不同（默认只记一笔，不一定开口）。
+            notice = parse_notice(payload, self.self_id)
+            if notice is None or self.on_notice is None:
+                return
+            try:
+                await self.on_notice(notice)
+            except Exception as exc:  # noqa: BLE001 - 一条通知出错不能带崩连接
+                self.log(f"⚠ 处理这条通知出错了：{exc.__class__.__name__}: {exc}")
             return
         event = parse_event(payload, self.self_id)
         if event is None:

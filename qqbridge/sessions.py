@@ -7,9 +7,13 @@
 所以「同步进前端」不是另开一套，而是把同一轮对话往这两个 session 里各写一份 ——
 大老大在小窝里往下翻，就能看见 QQ 里聊过什么。
 
-**一个账号 = 一个小糖人**：一个桥接进程管一个 QQ 号（也就一个小糖人）。
-想让多个小糖人都在 QQ 上，就把这个项目跑多份、每份一个账号（各自的 config.json）。
+**一个账号 = 一个小糖人**：一个桥接进程可以带**多个 QQ 号**（`config.accounts()`，大老大：
+「我 QQ 号一堆，可以每个都配一个」）。每个号有自己的人格、自己的白名单、自己的网关端口，
+所以每个号一个 `Router` 实例、一个 `OneBotClient` 连接 —— 它们互不干扰。
 群聊里被 @ 时由本账号那个人格回；几个小糖人同在群里就各回各的 —— 不会互相抢话。
+
+前端「这个号演谁」的切换：小窝里改 `accounts[i].persona`（或单账号的 `persona.character_id`），
+桥每轮 pull 一次设置 → 下一轮就换人，不用重启。
 
 去重：网关重连时可能把最近的事件重放一遍（各家实现不一），所以按 message_id 记一个
 有上限的小 LRU，见过的直接跳过 —— 不然重连一次就会重复回一遍话。
@@ -97,17 +101,28 @@ class Router:
     # 启动参数指定的身份（小窝前端「这个号演谁」）—— 优先于配置文件。
     override = ""
 
-    def __init__(self, cfg: dict, brain: BrainClient, logger=print):
+    def __init__(self, cfg: dict, brain: BrainClient, logger=print, account: dict | None = None):
         self.cfg = cfg
         self.brain = brain
         self.log = logger
+        # 这个 Router 服务的那个 QQ 号（`config.accounts()` 里的一条）。None = 单账号。
+        self.account = account or {}
         self.seen = SeenMessages()
-        self.seen.load(config_mod.state_file("seen_messages.json"))
+        self.seen.load(config_mod.state_file(
+            f"seen_messages{'-' + str(self.account.get('self_id')) if self.account.get('self_id') else ''}.json"))
         self._persona = ""
         self._roster: list[dict] = []
         self.pending: dict[str, PendingTurn] = {}
+        self._intro: list[str] = []      # 启动时想让人看见的话（多账号时由 handle 打前缀）
 
-    # ---- 人格 / 名册 ----
+    def note(self, text: str) -> None:
+        """记一句要在日志里说的话（多账号时自动带 `[号名]` 前缀）。"""
+        self._intro.append(text)
+        self.log(text)
+
+    def drain(self) -> list[str]:
+        out, self._intro = self._intro, []
+        return out
 
     def refresh_roster(self) -> list[dict]:
         """从大脑拉角色名册（= 角色介绍里的人）。拉不到就退回配置里的那个。"""
@@ -115,21 +130,26 @@ class Router:
         return self._roster
 
     def persona(self) -> str:
-        """本账号演谁。优先级：启动时指定的 → config.persona.character_id → 名册第一个（并提醒一次）。
+        """本账号演谁。优先级：启动时指定的 → 这个号的配置 → 名册第一个（并提醒一次）。
 
         **不猜**：没配就明确说「你没配，我先用谁」—— 悄悄换人最难受。
         """
         if self._persona:
             return self._persona
-        name = str(self.override or ((self.cfg.get("persona") or {}).get("character_id")) or "").strip()
+        name = str(self.override or self.account.get("persona")
+                   or ((self.cfg.get("persona") or {}).get("character_id")) or "").strip()
         if not name:
             roster = self._roster or self.refresh_roster()
             if roster:
                 name = str(roster[0].get("id") or "")
-                self.log(f"⚠ config.json 没写 persona.character_id，先按名册第一个人 `{name}` 演。"
-                         f"要换人就把这一项填上。")
+                self.note(f"⚠ 没写这个号演谁，先按名册第一个人 `{name}` 演。"
+                          f"要换人去小窝前端「💬 QQ 桥设置 → 谁在 QQ 上」里改。")
         self._persona = name
         return name
+
+    def reset_persona(self) -> None:
+        """设置变了（前端换了人）→ 下次重新算一遍，并把提醒也重置掉。"""
+        self._persona = ""
 
     def persona_name(self) -> str:
         pid = self.persona()
@@ -140,22 +160,34 @@ class Router:
 
     # ---- 放行判断 ----
 
+    def _groups(self) -> list[str]:
+        """这个号接哪些群：**号上写了就用号的**，没写才用顶层白名单。"""
+        own = self.account.get("groups")
+        if own is not None:
+            return [str(g) for g in own]
+        return [str(g) for g in ((self.cfg.get("allow") or {}).get("groups") or [])]
+
+    def _private(self) -> list[str]:
+        own = self.account.get("private")
+        if own is not None:
+            return [str(p) for p in own]
+        return [str(p) for p in ((self.cfg.get("allow") or {}).get("private") or [])]
+
     def allowed(self, event: Event) -> tuple[bool, str]:
         """**白名单**判断：这个群 / 这个人允不允许被我看见。
 
         注意这里**不管 @ 不 @** —— 「能不能看见」和「要不要开口」是两件事
         （见 route()）：白名单里的群聊会同步进前端，但只有 @ 我才回。
         """
-        allow = self.cfg.get("allow") or {}
         owner = str(((self.cfg.get("owner") or {}).get("qq")) or "")
         is_owner = bool(owner) and event.user_id == owner
         if event.user_id == event.self_id:
             return False, "自己发的"
         if event.is_group:
-            if event.group_id not in [str(g) for g in (allow.get("groups") or [])]:
+            if event.group_id not in self._groups():
                 return False, f"群 {event.group_id} 不在白名单里"
             return True, ""
-        if event.user_id in [str(p) for p in (allow.get("private") or [])]:
+        if event.user_id in self._private():
             return True, ""
         if is_owner and (self.cfg.get("owner") or {}).get("whitelist_bypass", True):
             return True, ""
@@ -178,14 +210,26 @@ class Router:
         mode = ((self.cfg.get("modes") or {}).get("group" if event.is_group else "dm") or "chat")
         if mode == "silent":
             return Route(True, False, session, kind, character_id, "这个会话设成静音了：只同步，不开口")
-        if event.is_group and (self.cfg.get("allow") or {}).get("require_mention_in_group", True) \
-                and not event.mentions_me():
-            # 群里别的话：同步下来（大老大看得到群聊上下文），但不插嘴。
+        # 已经 @ 我了 → 一定是叫我（不用再看后面的规则）。
+        if event.is_group and not event.mentions_me():
             owner = str(((self.cfg.get("owner") or {}).get("qq")) or "")
+            is_owner = bool(owner) and event.user_id == owner
             bypass = (self.cfg.get("owner") or {}).get("whitelist_bypass", True)
-            if not (bypass and owner and event.user_id == owner):
+            # **「叫名字」也算叫我**：QQ 群里的 @ 经常被客户端吞成纯文本（尤其是转发 / 复制的话），
+            # 只认 at 段会漏掉一大半。这里多认一条「消息里出现了本账号小糖人的名字」。
+            if self.mentions_name(event):
+                return Route(True, True, session, kind, character_id, "")
+            if (self.cfg.get("allow") or {}).get("require_mention_in_group", True) and not (bypass and is_owner):
+                # 群里别的话：同步下来（大老大看得到群聊上下文），但不插嘴。
                 return Route(True, False, session, kind, character_id, "群里没 @ 我：只同步，不插嘴")
         return Route(True, True, session, kind, character_id, "")
+
+    def mentions_name(self, event: Event) -> bool:
+        """消息文本里有没有直接叫本账号那位小糖人的名字（兜住「@ 被吞成文本」的情况）。"""
+        name = self.persona_name()
+        if not name or name == "?" or len(name) < 2:
+            return False
+        return name in event.plain_text()
 
     # ---- 记忆轮次 ----
 
@@ -216,4 +260,47 @@ class Router:
                 self.log(f"⚠ 记忆提炼没成功：{exc}")
 
     def save(self) -> None:
-        self.seen.save(config_mod.state_file("seen_messages.json"))
+        self.seen.save(self._seen_path())
+
+    def _seen_path(self) -> Path:
+        """去重表按账号分开存（多账号共用一个文件会互相顶掉）。"""
+        tag = f"-{self.account.get('self_id')}" if self.account.get("self_id") else ""
+        return config_mod.state_file(f"seen_messages{tag}.json")
+
+    # ---- 管理命令（**桥直接执行，不过模型**）----
+
+    def admin_command(self, event: Event) -> dict | None:
+        """大老大发的 `/xxx` 命令 → 桥自己执行。
+
+        返回 `{"reply": 回什么, "action": 要让桥做什么, "arg": 参数}`；不是命令就 None。
+        为什么不过模型：这些是**操作**（清上下文 / 静音 / 发言），让模型决定「要不要照做」
+        等于把开关交给了概率。参考项目也是桥接硬执行，我们照抄。
+
+        `action` 取值：`""`（只回话）/ `reset` / `silent` / `active` / `say`。
+        """
+        owner = str(((self.cfg.get("owner") or {}).get("qq")) or "")
+        if not (self.cfg.get("owner") or {}).get("admin_commands", True):
+            return None
+        if not owner or event.user_id != owner:
+            return None
+        text = event.plain_text().strip()
+        if not text.startswith("/"):
+            return None
+        name, _, rest = text[1:].partition(" ")
+        name, rest = name.strip().lower(), rest.strip()
+        if name in ("help", "?"):
+            return {"action": "", "arg": "", "reply": (
+                "能用的：/reset 忘掉这个会话刚才聊的 · /silent 这个会话只看不说 · "
+                "/active 恢复说话 · /whoami 我是谁 · /say 内容（我直接照发，不过模型）")}
+        if name == "whoami":
+            return {"action": "", "arg": "",
+                    "reply": f"我是「{self.persona_name()}」（{self.persona()}），这个号 {event.self_id or '(未知)'}。"}
+        if name == "reset":
+            return {"action": "reset", "arg": "", "reply": "好，这个会话刚才聊的我不记得了。"}
+        if name == "silent":
+            return {"action": "silent", "arg": "", "reply": "这个会话我只看不说了（/active 恢复）。"}
+        if name == "active":
+            return {"action": "active", "arg": "", "reply": "回来了，说话吧。"}
+        if name == "say" and rest:
+            return {"action": "say", "arg": rest, "reply": ""}
+        return {"action": "", "arg": "", "reply": f"不认识 `/{name}`，发 /help 看看有哪些。"}

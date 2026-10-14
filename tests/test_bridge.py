@@ -234,5 +234,177 @@ class SegmentTests(unittest.TestCase):
             self.assertEqual(onebot.seg_record_file(str(target))["type"], "record")
 
 
+class VoiceTranscriptionTests(unittest.TestCase):
+    """语音识别走 **QQ 自己的转写**（大老大定的：'ASR 用 QQ 的，qq 有转写的'）。"""
+
+    def test_gateway_text_is_used(self):
+        seg = {"type": "record", "data": {"file": "a.silk", "text": "今晚吃什么"}}
+        self.assertEqual(onebot.text_of_record(seg), "今晚吃什么")
+
+    def test_placeholder_is_not_a_transcription(self):
+        # 有些网关没转写时会把文件名 / "[语音]" 塞进 summary —— 那些不算听懂。
+        for value in ("[语音]", "语音", "voice", "a.silk"):
+            self.assertEqual(onebot.text_of_record({"data": {"summary": value}}), value
+                             if value not in ("[语音]", "语音", "voice") else "")
+
+    def test_missing_transcription_returns_empty(self):
+        self.assertEqual(onebot.text_of_record({"data": {"file": "a.silk"}}), "")
+
+
+class NoticeTests(unittest.TestCase):
+    """通知事件：戳一戳会回一句，其余默认不处理（大老大批注「都想要」+ 防刷屏）。"""
+
+    def test_poke_targeting_me_is_parsed(self):
+        payload = {"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+                   "user_id": "20002", "target_id": SELF, "group_id": "555"}
+        notice = onebot.parse_notice(payload, SELF)
+        self.assertIsNotNone(notice)
+        self.assertEqual(notice.kind, "poke")
+        self.assertTrue(notice.is_group)
+        self.assertEqual(notice.session_key, "g:555")
+
+    def test_group_member_change_is_parsed(self):
+        payload = {"post_type": "notice", "notice_type": "group_decrease", "sub_type": "leave",
+                   "user_id": "20002", "group_id": "555"}
+        self.assertEqual(onebot.parse_notice(payload, SELF).kind, "group_decrease")
+
+    def test_other_notices_ignored(self):
+        payload = {"post_type": "notice", "notice_type": "friend_add", "user_id": "20002"}
+        self.assertIsNone(onebot.parse_notice(payload, SELF))
+        self.assertIsNone(onebot.parse_notice({"post_type": "message"}, SELF))
+
+
+class AdminCommandTests(unittest.TestCase):
+    """管理命令**桥直接执行，不过模型**（让模型决定「要不要照做」等于把开关交给概率）。"""
+
+    def _router(self, **over):
+        base = {"owner": {"qq": "20002", "admin_commands": True}}
+        base.update(over)
+        return router(**base)
+
+    def test_non_owner_gets_nothing(self):
+        self.assertIsNone(self._router().admin_command(event(text="/reset", user="99999")))
+
+    def test_reset_returns_action(self):
+        got = self._router().admin_command(event(text="/reset"))
+        self.assertEqual(got["action"], "reset")
+
+    def test_say_carries_text(self):
+        got = self._router().admin_command(event(text="/say 大家早"))
+        self.assertEqual((got["action"], got["arg"]), ("say", "大家早"))
+
+    def test_unknown_command_is_reported(self):
+        self.assertIn("不认识", self._router().admin_command(event(text="/nope"))["reply"])
+
+    def test_admin_commands_can_be_turned_off(self):
+        self.assertIsNone(self._router(owner={"qq": "20002", "admin_commands": False})
+                          .admin_command(event(text="/reset")))
+
+
+class MultiAccountTests(unittest.TestCase):
+    """一份配置带多个 QQ 号（大老大：「我 QQ 号一堆，可以每个都配一个」）。"""
+
+    def test_accounts_fall_back_to_single(self):
+        rows = config_mod.accounts(cfg())
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["groups"])      # None = 用顶层白名单
+
+    def test_each_account_gets_its_own_port_and_persona(self):
+        rows = config_mod.accounts(cfg(accounts=[
+            {"name": "大号", "self_id": "111", "persona": "dalaoda", "listen_port": 3101},
+            {"name": "小号", "self_id": "222", "persona": "xiaoshiyin"},
+        ], onebot={"listen_port": 3100}))
+        self.assertEqual([r["listen_port"] for r in rows], [3101, 3101])   # 第二个按 3100+1
+        self.assertEqual([r["persona"] for r in rows], ["dalaoda", "xiaoshiyin"])
+
+    def test_disabled_account_is_skipped(self):
+        rows = config_mod.accounts(cfg(accounts=[
+            {"name": "停用的", "self_id": "111", "enabled": False},
+            {"name": "在用的", "self_id": "222"},
+        ]))
+        self.assertEqual([r["self_id"] for r in rows], ["222"])
+
+    def test_account_whitelist_overrides_top_level(self):
+        r = Router(cfg(), FakeBrain(), account={"groups": ["777"], "private": []})
+        self.assertEqual(r._groups(), ["777"])
+        self.assertEqual(r._private(), [])
+        self.assertTrue(r.allowed(event(group="777", mention=True))[0])
+        self.assertFalse(r.allowed(event(group="555", mention=True))[0])
+
+
+class SettingsMergeTests(unittest.TestCase):
+    """前端设置压过 config.json（§9.6.5）—— 你在网页上点的那一下才是最后生效的。"""
+
+    def tearDown(self):
+        config_mod.set_remote({})
+
+    def test_remote_overrides_local(self):
+        config_mod.set_remote({"allow.groups": ["888"], "voice.voice": "huayan"})
+        loaded = config_mod.apply_remote(cfg())
+        self.assertEqual(loaded["allow"]["groups"], ["888"])
+        self.assertEqual(loaded["voice"]["voice"], "huayan")
+
+    def test_unregistered_key_is_ignored(self):
+        config_mod.set_remote({"allow.everything": True, "evil.key": "x"})
+        loaded = config_mod.apply_remote(cfg())
+        self.assertNotIn("everything", loaded["allow"])
+        self.assertNotIn("evil", loaded)
+
+    def test_local_file_still_used_when_nothing_pulled(self):
+        config_mod.set_remote({})
+        self.assertEqual(config_mod.apply_remote(cfg())["allow"]["groups"], ["555"])
+
+
+class LocalToolTests(unittest.TestCase):
+    """本地小工具：给能力 + 画硬边界（大老大：「可以碰一下，只要别搞坏东西」）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "笔记.txt").write_text("今天要买牛奶", encoding="utf-8")
+        self.tools = __import__("qqbridge.tools", fromlist=["x"])
+        self.cfg = cfg(tools={"enabled": True, "root": str(self.root), "allow": ["dir", "read", "find"]})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_read_inside_sandbox(self):
+        ok, out = self.tools.run(self.cfg, "local_read", {"path": "笔记.txt"})
+        self.assertTrue(ok, out)
+        self.assertIn("牛奶", out)
+
+    def test_escape_is_denied(self):
+        ok, out = self.tools.run(self.cfg, "local_read", {"path": "../../secret.txt"})
+        self.assertFalse(ok)
+        self.assertIn("越界", out)
+
+    def test_absolute_path_outside_is_denied(self):
+        ok, out = self.tools.run(self.cfg, "local_read", {"path": "C:/Windows/win.ini"})
+        self.assertFalse(ok)
+
+    def test_shell_metacharacters_are_denied(self):
+        for path in ("x | cat /etc/passwd", "a > b.txt", "a; rm -rf /"):
+            self.assertFalse(self.tools.run(self.cfg, "local_read", {"path": path})[0], path)
+
+    def test_unlisted_action_is_denied(self):
+        ok, out = self.tools.run(self.cfg, "local_rm", {"path": "."})
+        self.assertFalse(ok)
+        self.assertIn("没有", out)
+
+    def test_disabled_by_default(self):
+        self.assertFalse(self.tools.enabled(cfg()))
+        self.assertEqual(self.tools.allowed_names(cfg()), [])
+
+    def test_config_cannot_add_new_actions(self):
+        # 配置只能从登记表里**挑**名字，塞一个 rm 进去是没用的。
+        names = self.tools.allowed_names(cfg(tools={"enabled": True, "allow": ["rm", "dir"]}))
+        self.assertEqual(names, ["dir"])
+
+    def test_deleting_names_are_hardcoded_forbidden(self):
+        self.assertIn("rm", self.tools.FORBIDDEN)
+        self.assertIn("del", self.tools.FORBIDDEN)
+        self.assertIn("format", self.tools.FORBIDDEN)
+
+
 if __name__ == "__main__":
     unittest.main()
