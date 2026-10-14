@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -404,6 +405,78 @@ class LocalToolTests(unittest.TestCase):
         self.assertIn("rm", self.tools.FORBIDDEN)
         self.assertIn("del", self.tools.FORBIDDEN)
         self.assertIn("format", self.tools.FORBIDDEN)
+
+
+class _FakeWS:
+    """站一个 WS：动作发出去后，在**读循环**里回 echo（真网关就是这么干的）。"""
+
+    def __init__(self, client: onebot.OneBotClient, answer: dict | None = None):
+        self.client = client
+        self.closed = False
+        self.answer = answer
+        self.sent: list[dict] = []
+
+    async def send_str(self, raw: str) -> None:
+        payload = json.loads(raw)
+        self.sent.append(payload)
+        echo = payload.get("echo")
+        data = dict(self.answer or {"retcode": 0, "data": {}})
+        data["echo"] = echo
+        # 关键：模拟网关的 echo 也要经 `_dispatch` 回来 —— 读循环被业务堵住就永远回不来。
+        asyncio.get_running_loop().call_soon(lambda: asyncio.create_task(self.client._dispatch(json.dumps(data))))
+
+
+class ReadLoopTests(unittest.IsolatedAsyncioTestCase):
+    """读循环不能被业务处理堵住 —— 堵住的动作全超时（真实踩过的坑）。"""
+
+    async def _client(self, answer: dict | None = None) -> tuple[onebot.OneBotClient, _FakeWS]:
+        client = onebot.OneBotClient(cfg(), lambda e: asyncio.sleep(0), print)
+        client.access_token = "t"
+        ws = _FakeWS(client, answer)
+        client._ws = ws
+        return client, ws
+
+    async def test_handler_runs_off_the_read_loop(self):
+        """处理里调动作能拿到 echo —— 说明读循环还活着。"""
+        client, _ = await self._client()
+        got: list[str] = []
+
+        async def on_event(event: onebot.Event) -> None:
+            result = await client.call("send_group_msg", {"group_id": 1})
+            got.append(str(result.get("retcode")))
+
+        client.on_event = on_event
+        await client._dispatch(json.dumps({"post_type": "message", "message_type": "private",
+                                           "user_id": "1", "message_id": "m1", "raw_message": "hi",
+                                           "message": [{"type": "text", "data": {"text": "hi"}}],
+                                           "self_id": "9"}))
+        await asyncio.sleep(0.05)
+        self.assertEqual(got, ["0"])
+
+    async def test_ptt_text_asks_the_gateway(self):
+        client, ws = await self._client({"retcode": 0, "data": {"text": "今天吃了吗"}})
+        self.assertEqual(await client.ptt_text("m1"), "今天吃了吗")
+        self.assertEqual(ws.sent[0]["action"], "fetch_ptt_text")
+        self.assertEqual(ws.sent[0]["params"]["message_id"], "m1")
+
+    async def test_ptt_text_empty_without_message_id(self):
+        client, ws = await self._client()
+        self.assertEqual(await client.ptt_text(""), "")
+        self.assertEqual(ws.sent, [])       # 没有 id 就不该打扰网关
+
+    async def test_ptt_text_falls_back_to_old_action_name(self):
+        """SnowLuma 三个别名（fetch_ptt_text / get_ptt_text / get_record_text）都要试。"""
+        calls: list[str] = []
+
+        async def call(action, params=None, timeout=20.0):
+            calls.append(action)
+            return {"retcode": 0 if action == "get_record_text" else 1404,
+                    "data": {"text": "喂" if action == "get_record_text" else ""}}
+
+        client, _ = await self._client()
+        client.call = call
+        self.assertEqual(await client.ptt_text("m9"), "喂")
+        self.assertEqual(calls, ["fetch_ptt_text", "get_ptt_text", "get_record_text"])
 
 
 if __name__ == "__main__":

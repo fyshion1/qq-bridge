@@ -42,6 +42,9 @@ DEFAULT: dict = {
         "access_token": "",
         "self_id": "",          # 留空 = 连上后问网关要（get_login_info）
         "reconnect_seconds": 5,
+        # 问网关要语音转写的等待上限（秒）。**必须大于网关自己等 QQ 推结果的时间**
+        # （SnowLuma 是 20s），否则我们总先放弃，本来拿得到的也丢了。
+        "ptt_timeout": 30,
     },
     # **多个 QQ 号**（大老大：「我 QQ 号一堆，可以每个都配一个」）：
     # 一个账号 = 一个小糖人 = 一份 {self_id, persona, 端口, 白名单}。

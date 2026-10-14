@@ -327,6 +327,9 @@ class OneBotClient:
         self.access_token = str(ob.get("access_token") or "")
         self.self_id = str(ob.get("self_id") or "")
         self.reconnect_seconds = int(ob.get("reconnect_seconds") or 5)
+        # 问网关要语音转写的等待上限。**必须大于网关自己等 QQ 推结果的时间**
+        # （SnowLuma 的 waitPttTransText 是 20s），否则我们永远先放弃。
+        self.ptt_timeout = float(ob.get("ptt_timeout") or 30)
         self.on_event = on_event
         self.on_notice = on_notice
         self.log = logger
@@ -335,6 +338,8 @@ class OneBotClient:
         self._session: Any = None
         self._stop = asyncio.Event()
         self.connected = asyncio.Event()
+        self._queue: asyncio.Queue | None = None
+        self._worker: asyncio.Task | None = None
 
     # ---- 动作 ----
 
@@ -389,6 +394,57 @@ class OneBotClient:
                 return str(url)   # 有些网关回本地绝对路径，交给下载那头处理
         return ""
 
+    async def ptt_text(self, message_id: str) -> str:
+        """问网关要这条语音的**转写文本**（SnowLuma 的 `fetch_ptt_text`）。
+
+        它不给就返回空串 —— 调用方按 `[语音]` 记，不装懂。
+
+        ⚠ 超时必须**大于**网关自己等 QQ 推结果的时间（SnowLuma 是 20s），
+        不然我们永远比它先放弃，本来能拿到的转写也拿不到。
+        别名只在网关「不认识这个动作」时才接着试 —— 认识但没转写，试几个都一样。
+        """
+        if not message_id:
+            return ""
+        for action in ("fetch_ptt_text", "get_ptt_text", "get_record_text"):
+            result = await self.call(action, {"message_id": message_id}, timeout=self.ptt_timeout)
+            if result.get("retcode") == 0:
+                text = str((result.get("data") or {}).get("text") or "").strip()
+                if text:
+                    return text
+            elif result.get("retcode") != 1404:      # 不是「没这个动作」就别再试别名了
+                return ""
+        return ""
+
+    # ---- 事件队列 ----
+    #
+    # ⚠ 读循环里**绝不能直接 await 业务处理**：处理里会调动作（发消息、问转写），
+    # 而动作的 echo 只有读循环能收 —— 在读循环里 await 处理 = 自己等自己，每条都超时。
+
+    def _ensure_worker(self) -> None:
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=256)
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._work())
+
+    async def _work(self) -> None:
+        """串行消费事件：一条处理完再处理下一条（顺序和以前一样，只是不堵读循环）。"""
+        assert self._queue is not None
+        while not self._stop.is_set():
+            handler, arg = await self._queue.get()
+            try:
+                await handler(arg)
+            except Exception as exc:  # noqa: BLE001 - 单条出错不能带崩整条连接
+                self.log(f"⚠ 处理这条事件出错了：{exc.__class__.__name__}: {exc}")
+            finally:
+                self._queue.task_done()
+
+    def _enqueue(self, handler: Handler | NoticeHandler, arg: Any) -> None:
+        self._ensure_worker()
+        try:
+            self._queue.put_nowait((handler, arg))  # type: ignore[union-attr]
+        except asyncio.QueueFull:
+            self.log("⚠ 事件堆太多处理不过来，这条丢了")
+
     # ---- 连接 ----
 
     async def run_forever(self) -> None:
@@ -408,6 +464,8 @@ class OneBotClient:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._worker is not None and not self._worker.done():
+            self._worker.cancel()
 
     async def _serve(self) -> None:
         """反向 WS：我们当服务端，网关连进来。"""
@@ -501,17 +559,11 @@ class OneBotClient:
             notice = parse_notice(payload, self.self_id)
             if notice is None or self.on_notice is None:
                 return
-            try:
-                await self.on_notice(notice)
-            except Exception as exc:  # noqa: BLE001 - 一条通知出错不能带崩连接
-                self.log(f"⚠ 处理这条通知出错了：{exc.__class__.__name__}: {exc}")
+            self._enqueue(self.on_notice, notice)
             return
         event = parse_event(payload, self.self_id)
         if event is None:
             return
         if not self.self_id and event.self_id:
             self.self_id = event.self_id
-        try:
-            await self.on_event(event)
-        except Exception as exc:  # noqa: BLE001 - 单条消息出错不能带崩整条连接
-            self.log(f"⚠ 处理这条消息出错了：{exc.__class__.__name__}: {exc}")
+        self._enqueue(self.on_event, event)

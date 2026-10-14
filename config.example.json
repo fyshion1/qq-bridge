@@ -10,7 +10,8 @@
     "ws_url": "ws://127.0.0.1:3001/",
     "access_token": "",
     "self_id": "",
-    "reconnect_seconds": 5
+    "reconnect_seconds": 5,
+    "ptt_timeout": 30
   },
   "accounts": [],
   "allow": {

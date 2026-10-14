@@ -250,7 +250,7 @@ class AccountRunner:
             if kind == "face":       # QQ 自带小黄脸：没有文件，只有 id
                 continue
             if kind == "record":
-                transcript = await self._voice_in(seg, transcript)
+                transcript = await self._voice_in(seg, transcript, event.message_id)
                 continue
             url = str(data.get("url") or data.get("file") or "")
             if not url:
@@ -288,13 +288,14 @@ class AccountRunner:
         self._last_images = images_for_model[:MAX_IMAGES_PER_TURN]
         return transcript, items
 
-    async def _voice_in(self, seg: dict, current: str) -> str:
+    async def _voice_in(self, seg: dict, current: str, message_id: str = "") -> str:
         """一条语音 → 文字。**优先用 QQ 自己的转写**（大老大定的），再退到外部 whisper。
 
-        三级降级，每级都留痕：
-        1. 网关已经给了 `record.text`（手机上「转文字」那个）→ 直接用，一分钱不花；
-        2. `asr.engine=openai` → 下载语音 → 外部 whisper（音频过上游，要花钱）；
-        3. 都没有 → 返回空串，调用方按 `[语音]` 记，**不假装听懂**。
+        四级降级，每级都留痕：
+        1. 网关在消息段里顺手给了 `record.text`（手机上「转文字」那个）→ 直接用，一分钱不花；
+        2. 消息段里没有，但网关**支持事后问**（SnowLuma 的 `fetch_ptt_text`）→ 拿 message_id 问一次；
+        3. `asr.engine=openai` → 下载语音 → 外部 whisper（音频过上游，要花钱）；
+        4. 都没有 → 返回空串，调用方按 `[语音]` 记，**不假装听懂**。
         """
         given = onebot.text_of_record(seg)
         if given:
@@ -302,6 +303,10 @@ class AccountRunner:
             return given
         if current:
             return current
+        asked = await self.client.ptt_text(message_id)
+        if asked:
+            self.log(f"[{self.label()}] 🎧 QQ 转写（问网关要的）：{asked[:40]}")
+            return asked
         engine = str((self.cfg.get("asr") or {}).get("engine") or "qq")
         if engine != "openai":
             self.log(f"[{self.label()}] ℹ 收到语音，网关没给转写，也没开外部识别 —— 按 [语音] 记下")
