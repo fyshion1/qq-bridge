@@ -118,6 +118,10 @@ DEFAULT: dict = {
         "enabled": True,
         "isolate": False,        # False = 汇入普通记忆（大老大批注：QQ 聊的日常也记得）
         "window": 24,            # 攒够多少条提一次
+        # 静了这么久没说话就提炼（秒）。**别指望「关后端时提炼」** —— 前端「停止」
+        # 走的是 process.terminate()，Windows 上不会变成 SIGINT，那个 finally 压根不跑
+        # （日志里「收工，QQ 桥停了」一直是 0 次）。所以靠这条兜底，5 分钟不说话就收。
+        "idle_seconds": 300,
     },
     # 本地小工具（大老大：「不碰本地工具的话，我倒是希望他能碰一下，只要别搞坏东西」）。
     # 默认**关**。开了之后：只在 root 里活动 + 只跑登记表里的动作 + 危险操作永久拒绝。
@@ -183,6 +187,7 @@ REMOTE_KEYS: dict[str, tuple[str, ...]] = {
     "sync.to_frontend": ("sync", "to_frontend"),
     "sync.persona_id": ("sync", "persona_id"),
     "memory.isolate": ("memory", "isolate"),
+    "memory.idle_seconds": ("memory", "idle_seconds"),
     "events.poke": ("events", "poke"),
     "events.notice": ("events", "notice"),
     "media.video_frames": ("media", "video_frames"),

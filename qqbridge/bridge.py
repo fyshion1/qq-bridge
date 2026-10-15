@@ -625,10 +625,18 @@ class AccountRunner:
 
     def tick(self, *, shutdown: bool = False) -> None:
         """定时活。`shutdown=True`（收工/被停掉）时**不管攒没攒够都把这段记忆交出去**——
-        「聊几句就关后端」这种用法靠这条才留得下东西（见 Router.flush_memory）。"""
+        「聊几句就关后端」这种用法靠这条才留得下东西（见 Router.flush_memory）。
+
+        **但别指望 shutdown 那条路**：前端「停止」走的是 `process.terminate()`，
+        Windows 上不会变成 SIGINT，这个分支实测一次都没跑到过。所以真正兜底的是
+        `flush_idle`：静了一会儿就提炼，不靠「谁想起来关一下」。
+        """
         self.history.save()
         self.router.save()
         self.router.flush_memory(force=shutdown)
+        idle = float((self.cfg.get("memory") or {}).get("idle_seconds") or 0)
+        if idle > 0:
+            self.router.flush_idle(idle)
         self._prune_voice()
 
     def _prune_voice(self) -> None:

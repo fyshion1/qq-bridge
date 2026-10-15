@@ -327,8 +327,14 @@ fetch_ptt_text {"message_id": -383226619}
 攒够 `memory.window` 条（默认 24）提一次给大脑。要隔离就把 `isolate` 改 true。
 
 **没攒够也不会丢**：攒记忆的草稿存在 `data/pending_memory-<号>.json`（有多少存多少），
-中途关后端接着攒；**正常停掉时不管攒没攒够都会提炼一次**（`force`），所以「聊几句就关」
-也能留下东西。只有硬杀（`taskkill /F`）才会停在「下次启动接着攒」。
+中途关后端接着攒。攒够 `memory.window` 提一次；**没攒够也不要紧** —— 静了
+`memory.idle_seconds`（默认 300 秒 = 5 分钟）没人说话就提炼掉（`flush_idle`），
+所以「聊几句就放着」照样记得住。
+
+> ⚠ **别再指望「停止的时候提炼一次」。** 代码里 `shutdown` 那条路（`finally` → `flush_memory(force=True)`）
+> 是留着的，但前端「停止」走的是 `process.terminate()`，**Windows 上不会变成 SIGINT**，
+> 那个 `finally` 实测一次都没跑到过（日志里 `收工，QQ 桥停了` 0 次）。
+> 真正兜底的是 `flush_idle`：靠时间，不靠「谁想起来关一下」。
 
 ---
 
@@ -360,6 +366,7 @@ fetch_ptt_text {"message_id": -383226619}
 | `sticker` | `auto_collect` / `reply_chance` | `true` / `0` | 学不学表情 / 主动发的概率 |
 | | `library` | `[]` | 表情包库（**本体附件库的引用**，不另存副本） |
 | `memory` | `isolate` / `window` | `false` / `24` | 记忆隔离 / 攒多少条提一次 |
+| | `idle_seconds` | `300` | 静了这么久（秒）就把这段提炼掉，**不等攒够 window**（见上面「同步进小窝」） |
 | `tools` | `enabled` | `false` | **本地小工具**：默认关；开了也只在划定的目录里跑只读动作 |
 | | `root` / `allow` / `max_bytes` | `data/sandbox/` / dir,read,find,info / 8000 | 只许碰哪个目录 / 允许哪些动作 / 单次读多少字 |
 | | `require_owner` / `max_turns` | `true` / `3` | 只有大老大能触发 / 一轮最多来回几次 |
@@ -449,8 +456,8 @@ QQ 号自己的昵称 / 签名 / 性别 / 头像，走网关的 OneBot 动作就
 python -m unittest discover -s tests -v
 ```
 
-49 个纯离线用例（不连真 QQ、不连大脑），重点压三件最容易出事又最难肉眼发现的事：
-**白名单**、**同步 vs 开口**、**重放去重**。
+57 个纯离线用例（不连真 QQ、不连大脑），重点压三件最容易出事又最难肉眼发现的事：
+**白名单**、**同步 vs 开口**、**重放去重**（外加记忆轮次的落盘与按时间提炼）。
 
 ---
 

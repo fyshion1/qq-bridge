@@ -69,7 +69,8 @@
   "memory": {
     "enabled": true,
     "isolate": false,
-    "window": 24
+    "window": 24,
+    "idle_seconds": 300
   },
   "tools": {
     "enabled": false,

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,11 +54,15 @@ class PendingTurn:
     session_kind: str
     character_ids: list[str]
     lines: list[str] = field(default_factory=list)
+    # 最后一句是什么时候说的（`time.time()`）。用来判断「这段是不是聊完了」——
+    # 静一会儿就提炼，不等攒够 window（见 Router.flush_idle）。
+    last_at: float = 0.0
 
     def add(self, who: str, text: str) -> None:
         text = (text or "").strip()
         if text:
             self.lines.append(f"{who}：{text}")
+            self.last_at = time.time()
 
     def flush_text(self) -> str:
         return "\n".join(self.lines)
@@ -65,14 +70,19 @@ class PendingTurn:
     def to_dict(self) -> dict:
         return {"session_kind": self.session_kind,
                 "character_ids": list(self.character_ids),
-                "lines": list(self.lines)}
+                "lines": list(self.lines),
+                "last_at": self.last_at}
 
     @classmethod
     def from_dict(cls, data: dict) -> "PendingTurn":
-        """从落盘的那份读回来。字段缺了就用安全默认，**宁可能力降级也别崩**。"""
+        """从落盘的那份读回来。字段缺了就用安全默认，**宁可能力降级也别崩**。
+
+        `last_at` 缺省 0 = 上一轮遗留的草稿，下次心跳就会被当成「早就静了」提炼掉。
+        """
         return cls(str(data.get("session_kind") or "group"),
                    [str(c) for c in (data.get("character_ids") or [])],
-                   [str(line) for line in (data.get("lines") or [])])
+                   [str(line) for line in (data.get("lines") or [])],
+                   float(data.get("last_at") or 0.0))
 
 
 class SeenMessages:
@@ -255,9 +265,9 @@ class Router:
             turn.character_ids.append(character_id)
 
     def flush_memory(self, *, force: bool = False) -> None:
-        """把攒够的轮次交给大脑提炼记忆（默认进**普通记忆**，见 brain.extract_memories）。
+        """把该提炼的轮次交给大脑提炼记忆（默认进**普通记忆**，见 brain.extract_memories）。
 
-        `force=True`（收工 / 被停掉时）**不看 window 也提炼一次** —— 不然「聊了几句就关」
+        `force=True`（收工 / 被停掉时）**不看任何门槛也提炼一次** —— 不然「聊了几句就关」
         这种用法永远攒不满，攒的那点话就白说了。
         """
         mem = self.cfg.get("memory") or {}
@@ -270,16 +280,43 @@ class Router:
         for key, turn in list(self.pending.items()):
             if not force and len(turn.lines) < window:
                 continue
-            text = turn.flush_text()
+            self._flush_one(key, turn)
+
+    def flush_idle(self, idle_seconds: float = 300.0) -> None:
+        """**时间到了就提炼**，不等攒够 window —— 「聊几句就放着」才是最常用的用法。
+
+        每 30 秒心跳扫一遍：某个会话**连续 idle_seconds 没人说话**（默认 5 分钟）了，
+        就把这段草稿提炼掉（哪怕只有 4 行）。攒够 window 的本来就该提，不冲突。
+        没攒够窗口、但聊到一半就不聊了 —— 也不能让那几句话死于重启。
+        """
+        mem = self.cfg.get("memory") or {}
+        if not mem.get("enabled", True):
+            self.pending.clear()
+            self._save_pending()
+            return
+        self.brain.isolate_memory = bool(mem.get("isolate", False))
+        now = time.time()
+        for key, turn in list(self.pending.items()):
+            if now - turn.last_at < idle_seconds:
+                continue
+            # window 3（≈1.5 轮）这种阈值：攒够的本来就会被 flush_memory 提走，
+            # 走到这里的是「没攒够但静下来了」的 —— 提炼掉，腾给下一段。
+            self._flush_one(key, turn)
+
+    def _flush_one(self, key: str, turn: PendingTurn) -> None:
+        if not turn.lines:
             self.pending.pop(key, None)
-            try:
-                self.brain.extract_memories(text, character_ids=turn.character_ids,
-                                            session_kind=turn.session_kind)
-                self.log(f"🧠 记住了一轮（{len(turn.lines)} 条）")
-            except BrainError as exc:
-                # ⚠ 提炼失败就把这段**塞回去**（收工时尤其重要：大脑没起也不能把话丢了）。
-                self.pending.setdefault(key, turn)
-                self.log(f"⚠ 记忆提炼没成功：{exc}")
+            return
+        text = turn.flush_text()
+        self.pending.pop(key, None)
+        try:
+            self.brain.extract_memories(text, character_ids=turn.character_ids,
+                                        session_kind=turn.session_kind)
+            self.log(f"🧠 记住了一轮（{len(turn.lines)} 条）")
+        except BrainError as exc:
+            # ⚠ 提炼失败就把这段**塞回去**（收工时尤其重要：大脑没起也不能把话丢了）。
+            self.pending.setdefault(key, turn)
+            self.log(f"⚠ 记忆提炼没成功：{exc}")
         self._save_pending()
 
     # ---- pending 落盘 ----

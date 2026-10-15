@@ -14,6 +14,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -269,6 +270,34 @@ class PendingMemoryPersistenceTests(unittest.TestCase):
         router().save()
         next(_TMP_STATE.glob("pending_memory*.json")).write_text("{坏掉的 json", encoding="utf-8")
         self.assertEqual(router().pending, {})
+
+    def test_idle_flush_ignores_the_window(self):
+        """没攒够 window、但静下来了 → 也提炼。这是**真正兜底的那条路**
+        （前端「停止」走 terminate，Windows 上不产生 SIGINT，shutdown 分支跑不到）。"""
+        r = router(memory={"enabled": True, "window": 24, "idle_seconds": 300})
+        r.remember("g:555", "group", "dalaoda", "大老大", "就一句话")
+        r.pending["g:555"].last_at = time.time() - 400      # 上一句话是 400 秒前
+        r.flush_idle(300)
+        self.assertIn(("memory", ["dalaoda"]), r.brain.calls)  # type: ignore[attr-defined]
+        self.assertEqual(r.pending, {})
+
+    def test_still_talking_is_not_flushed(self):
+        """刚说完的别急着提 —— 不然一句一提炼，记忆碎成渣。"""
+        r = router(memory={"enabled": True, "window": 24, "idle_seconds": 300})
+        r.remember("g:555", "group", "dalaoda", "大老大", "刚说的一句")
+        r.flush_idle(300)
+        self.assertNotIn(("memory", ["dalaoda"]), r.brain.calls)  # type: ignore[attr-defined]
+        self.assertIn("g:555", r.pending)
+
+    def test_leftover_draft_is_flushed_on_the_first_heartbeat(self):
+        """别处留下的草稿（last_at=0）第一次心跳就该提走 —— 不然它永远躺在文件里。"""
+        first = router(memory={"enabled": True, "window": 99})
+        first.remember("g:555", "group", "dalaoda", "大老大", "上一轮遗留的")
+        first.pending["g:555"].last_at = 0.0
+        first.save()
+        again = router(memory={"enabled": True, "window": 99, "idle_seconds": 300})
+        again.flush_idle(300)
+        self.assertIn(("memory", ["dalaoda"]), again.brain.calls)  # type: ignore[attr-defined]
 
 
 class SegmentTests(unittest.TestCase):
