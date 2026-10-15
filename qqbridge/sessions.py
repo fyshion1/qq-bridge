@@ -62,6 +62,18 @@ class PendingTurn:
     def flush_text(self) -> str:
         return "\n".join(self.lines)
 
+    def to_dict(self) -> dict:
+        return {"session_kind": self.session_kind,
+                "character_ids": list(self.character_ids),
+                "lines": list(self.lines)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PendingTurn":
+        """从落盘的那份读回来。字段缺了就用安全默认，**宁可能力降级也别崩**。"""
+        return cls(str(data.get("session_kind") or "group"),
+                   [str(c) for c in (data.get("character_ids") or [])],
+                   [str(line) for line in (data.get("lines") or [])])
+
 
 class SeenMessages:
     """有上限的「见过的消息 id」集合（重连重放 / 自己发的回声都挡在外头）。"""
@@ -112,7 +124,10 @@ class Router:
             f"seen_messages{'-' + str(self.account.get('self_id')) if self.account.get('self_id') else ''}.json"))
         self._persona = ""
         self._roster: list[dict] = []
+        # 攒着准备提炼记忆的轮次。**会落盘**（`pending_memory-<号>.json`）——
+        # 不落盘的话，只要中途关一次后端就归零，「凑够 window 条」永远到不了。
         self.pending: dict[str, PendingTurn] = {}
+        self._load_pending()
         self._intro: list[str] = []      # 启动时想让人看见的话（多账号时由 handle 打前缀）
 
     def note(self, text: str) -> None:
@@ -239,16 +254,21 @@ class Router:
         if character_id not in turn.character_ids:
             turn.character_ids.append(character_id)
 
-    def flush_memory(self) -> None:
-        """把攒够的轮次交给大脑提炼记忆（默认进**普通记忆**，见 brain.extract_memories）。"""
+    def flush_memory(self, *, force: bool = False) -> None:
+        """把攒够的轮次交给大脑提炼记忆（默认进**普通记忆**，见 brain.extract_memories）。
+
+        `force=True`（收工 / 被停掉时）**不看 window 也提炼一次** —— 不然「聊了几句就关」
+        这种用法永远攒不满，攒的那点话就白说了。
+        """
         mem = self.cfg.get("memory") or {}
         if not mem.get("enabled", True):
             self.pending.clear()
+            self._save_pending()
             return
         window = int(mem.get("window") or 24)
         self.brain.isolate_memory = bool(mem.get("isolate", False))
         for key, turn in list(self.pending.items()):
-            if len(turn.lines) < window:
+            if not force and len(turn.lines) < window:
                 continue
             text = turn.flush_text()
             self.pending.pop(key, None)
@@ -257,10 +277,41 @@ class Router:
                                             session_kind=turn.session_kind)
                 self.log(f"🧠 记住了一轮（{len(turn.lines)} 条）")
             except BrainError as exc:
+                # ⚠ 提炼失败就把这段**塞回去**（收工时尤其重要：大脑没起也不能把话丢了）。
+                self.pending.setdefault(key, turn)
                 self.log(f"⚠ 记忆提炼没成功：{exc}")
+        self._save_pending()
+
+    # ---- pending 落盘 ----
+
+    def _pending_path(self) -> Path:
+        """攒记忆的暂存文件按账号分开存（和去重表同一个道理）。"""
+        tag = f"-{self.account.get('self_id')}" if self.account.get("self_id") else ""
+        return config_mod.state_file(f"pending_memory{tag}.json")
+
+    def _load_pending(self) -> None:
+        """启动时把上次没提炼完的轮次读回来。文件坏了就当没有，绝不让它拦住启动。"""
+        path = self._pending_path()
+        if not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.pending = {str(k): PendingTurn.from_dict(v) for k, v in (raw or {}).items()
+                            if isinstance(v, dict)}
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            self.pending = {}
+
+    def _save_pending(self) -> None:
+        try:
+            payload = {key: turn.to_dict() for key, turn in self.pending.items()}
+            self._pending_path().write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.log(f"⚠ 攒的记忆没存下来（不影响这次聊天）：{exc}")
 
     def save(self) -> None:
         self.seen.save(self._seen_path())
+        self._save_pending()
 
     def _seen_path(self) -> Path:
         """去重表按账号分开存（多账号共用一个文件会互相顶掉）。"""

@@ -623,10 +623,12 @@ class AccountRunner:
 
     # ---- 定时活 ----
 
-    def tick(self) -> None:
+    def tick(self, *, shutdown: bool = False) -> None:
+        """定时活。`shutdown=True`（收工/被停掉）时**不管攒没攒够都把这段记忆交出去**——
+        「聊几句就关后端」这种用法靠这条才留得下东西（见 Router.flush_memory）。"""
         self.history.save()
         self.router.save()
-        self.router.flush_memory()
+        self.router.flush_memory(force=shutdown)
         self._prune_voice()
 
     def _prune_voice(self) -> None:
@@ -713,7 +715,7 @@ class Bridge:
             raise
         finally:
             for runner in self.accounts:
-                runner.tick()
+                runner.tick(shutdown=True)
             await self._flush_settings()
             self.log("收工，QQ 桥停了。")
 

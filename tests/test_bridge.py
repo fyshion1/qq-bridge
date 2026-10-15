@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from qqbridge import config as config_mod  # noqa: E402
 from qqbridge import onebot  # noqa: E402
-from qqbridge.brain import BrainClient  # noqa: E402
+from qqbridge.brain import BrainClient, BrainError  # noqa: E402
 from qqbridge.onebot import Event, parse_event, split_text  # noqa: E402
 from qqbridge.sessions import Router, SeenMessages  # noqa: E402
 
@@ -85,6 +85,12 @@ def cfg(**over) -> dict:
         else:
             base[key] = value
     return base
+
+
+# Router 现在会把「攒着等提炼的记忆」落盘 —— 测试不能往真的 data/ 里写，
+# 统一指到一个临时目录（`state_file` 每次现读 STATE_DIR，改了立刻生效）。
+_TMP_STATE = Path(tempfile.mkdtemp(prefix="qqbridge-test-"))
+config_mod.STATE_DIR = _TMP_STATE
 
 
 def router(**over) -> Router:
@@ -217,6 +223,52 @@ class MemoryTests(unittest.TestCase):
         r = router(memory={"enabled": True, "window": 99})
         r.remember("g:555", "group", "dalaoda", "小明", "   ")
         self.assertEqual(r.pending["g:555"].lines, [])
+
+
+class PendingMemoryPersistenceTests(unittest.TestCase):
+    """攒着等提炼的轮次要**落盘** —— 关一次后端就归零的话，永远攒不够 window。"""
+
+    def setUp(self):
+        for path in _TMP_STATE.glob("pending_memory*.json"):
+            path.unlink()
+
+    def test_survives_a_restart(self):
+        first = router(memory={"enabled": True, "window": 99})
+        first.remember("g:555", "group", "dalaoda", "小明", "第一句")
+        first.save()
+        again = router(memory={"enabled": True, "window": 99})
+        self.assertIn("g:555", again.pending)
+        self.assertEqual(again.pending["g:555"].lines, ["小明：第一句"])
+        self.assertEqual(again.pending["g:555"].character_ids, ["dalaoda"])
+
+    def test_shutdown_flush_ignores_the_window(self):
+        """收工时不管攒了几条都提炼一次 —— 「聊几句就关」才留得下东西。"""
+        r = router(memory={"enabled": True, "window": 24})
+        r.remember("g:555", "group", "dalaoda", "小明", "就一句")
+        r.flush_memory()
+        self.assertNotIn(("memory", ["dalaoda"]), r.brain.calls)  # type: ignore[attr-defined]
+        r.flush_memory(force=True)
+        self.assertIn(("memory", ["dalaoda"]), r.brain.calls)  # type: ignore[attr-defined]
+        self.assertEqual(r.pending, {})
+
+    def test_failed_extraction_puts_the_turn_back(self):
+        """提炼失败（大脑没起）不能把话丢了 —— 塞回去下次再来。"""
+        r = router(memory={"enabled": True, "window": 2})
+        r.remember("g:555", "group", "dalaoda", "小明", "第一句")
+        r.remember("g:555", "group", "dalaoda", "大老大", "第二句")
+
+        def boom(*_a, **_kw):
+            raise BrainError("大脑没起")
+
+        r.brain.extract_memories = boom  # type: ignore[method-assign]
+        r.flush_memory()
+        self.assertIn("g:555", r.pending)
+        self.assertEqual(len(r.pending["g:555"].lines), 2)
+
+    def test_corrupt_file_does_not_block_startup(self):
+        router().save()
+        next(_TMP_STATE.glob("pending_memory*.json")).write_text("{坏掉的 json", encoding="utf-8")
+        self.assertEqual(router().pending, {})
 
 
 class SegmentTests(unittest.TestCase):
