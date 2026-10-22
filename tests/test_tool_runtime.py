@@ -16,14 +16,18 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        (self.root / "note.txt").write_text("buy milk", encoding="utf-8")
         state = patch.object(config_mod, "STATE_DIR", self.root)
         state.start()
         self.addCleanup(state.stop)
         self.cfg = cfg(owner={"qq": "20002", "tools": True}, tools={
             "enabled": True, "require_owner": True, "root": str(self.root),
-            "allow": ["read", "info"], "max_turns": 3,
+            "allow": ["search"], "max_turns": 3,
         })
+        from xiaotangren_tools import web_search
+        search = patch.object(web_search, 'search', return_value='buy milk')
+        self.search = search.start(); self.addCleanup(search.stop)
+        installed = patch.object(web_search, 'available', return_value=True)
+        installed.start(); self.addCleanup(installed.stop)
         self.brain = FakeBrain()
         self.log = Mock()
         self.runner = AccountRunner(Mock(brain=self.brain, log=self.log), self.cfg, {}, 0)
@@ -32,24 +36,24 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for actor in ("", "stranger"):
             context = tools.context_for(self.cfg, actor)
             self.assertEqual(tools.tool_schema(self.cfg, context), [])
-            ok, output = await tools.arun(self.cfg, "local_read", {"path": "note.txt"}, context)
+            ok, output = await tools.arun(self.cfg, "web_search", {"query": "news"}, context)
             self.assertFalse(ok)
             self.assertIn("denied", output)
-        ok, _ = await tools.arun(self.cfg, "local_read", {"path": "note.txt"})
+        ok, _ = await tools.arun(self.cfg, "web_search", {"query": "news"})
         self.assertFalse(ok)
 
     async def test_owner_disabled_at_executor(self):
         self.cfg["owner"]["tools"] = False
-        ok, _ = await tools.arun(self.cfg, "local_info", {}, tools.context_for(self.cfg, "20002"))
+        ok, _ = await tools.arun(self.cfg, "web_search", {}, tools.context_for(self.cfg, "20002"))
         self.assertFalse(ok)
 
     async def test_legacy_names_and_strict_arguments(self):
         context = tools.context_for(self.cfg, "20002")
-        ok, text = await tools.arun(self.cfg, "read", {"path": "note.txt"}, context)
+        ok, text = await tools.arun(self.cfg, "search", {"query": "news"}, context)
         self.assertTrue(ok)
         self.assertEqual(text, "buy milk")
-        for args in ({}, {"path": 3}, {"path": "note.txt", "shell": True}):
-            ok, text = await tools.arun(self.cfg, "local_read", args, context)
+        for args in ({}, {"query": 3}, {"query": "news", "shell": True}):
+            ok, text = await tools.arun(self.cfg, "web_search", args, context)
             self.assertFalse(ok)
             self.assertIn("invalid_arguments", text)
 
@@ -59,11 +63,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         def tool_turn(character, turns, **kwargs):
             turns_seen.append(json.loads(json.dumps(turns)))
             if len(turns_seen) == 1:
-                self.assertEqual(kwargs["tools"][0]["function"]["name"], "local_read")
-                return {"tool_calls": [{"id": "c1", "name": "local_read",
-                                        "arguments": '{"path":"note.txt"}'}]}
+                self.assertEqual(kwargs["tools"][0]["function"]["name"], "web_search")
+                return {"tool_calls": [{"id": "c1", "name": "web_search",
+                                        "arguments": '{"query":"news"}'}]}
             self.assertEqual(turns[-1], {"role": "tool", "tool_call_id": "c1", "content": "buy milk"})
-            self.assertEqual(turns[-2]["tool_calls"][0]["function"]["name"], "local_read")
+            self.assertEqual(turns[-2]["tool_calls"][0]["function"]["name"], "web_search")
             return {"content": "Remember to buy milk", "tool_calls": []}
 
         self.brain.tool_turn = tool_turn
@@ -84,9 +88,9 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         def tool_turn(character, turns, **kwargs):
             calls.append(1)
             if len(calls) == 1:
-                return {"tool_calls": [{"id": "bad", "name": "local_read",
-                                        "arguments": '{"path":"../outside.txt"}'}]}
-            self.assertIn("denied", turns[-1]["content"])
+                return {"tool_calls": [{"id": "bad", "name": "web_search",
+                                        "arguments": '{"query":3}'}]}
+            self.assertIn("invalid_arguments", turns[-1]["content"])
             return {"content": "Access denied", "tool_calls": []}
 
         self.brain.tool_turn = tool_turn
@@ -97,7 +101,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_turn_limit_stops_repeated_calls(self):
         self.brain.tool_turn = Mock(return_value={"tool_calls": [
-            {"id": "again", "name": "local_info", "arguments": "{}"}]})
+            {"id": "again", "name": "web_search", "arguments": "{}"}]})
         incoming = event()
         await self.runner._reply_with_tools(self.runner.router.route(incoming), incoming,
                                            [{"role": "user", "content": "loop"}], [])

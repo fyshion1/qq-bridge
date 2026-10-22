@@ -103,8 +103,8 @@ DEFAULT: dict = {
         # none   = 不识别，收到就记 [语音]。
         # 大老大批注：「ASR 用 QQ 的，按项目的来，qq 有转写的」。
         "engine": "qq",
-        # qq 没有返回转写时，自动用已配置的兼容 /audio/transcriptions 接口兜底。
-        # 设为 none 可关闭；这会产生一次音频识别请求并可能计费。
+        # QQ 没有返回转写时，默认调用本体的本地 Paraformer（需单独安装依赖和模型）。
+        # none 可关闭；只有显式选 openai 才上传到已配置云端并可能计费。
         "fallback": "local",
         "base_url": "",          # 留空 = 用大脑给这个功能配的 base_url
         "api_key": "",           # 留空 = 用大脑那份 key（不落盘到别处）
@@ -153,9 +153,7 @@ DEFAULT: dict = {
     #    加不进新动作（写了个不存在的名字就是没这一项）。
     "tools": {
         "enabled": False,
-        "root": "",              # 留空 = data/sandbox/（第一次开的时候自动建）
-        "allow": ["dir", "read", "find", "info", "search"],
-        "max_bytes": 8000,       # 单次读多少字（截断，免得烧 token）
+        "allow": ["search"],
         "require_owner": True,   # 只有大老大的消息能触发
         "max_turns": 3,          # 一轮里最多来回几次（防模型钻牛角尖）
     },
@@ -173,6 +171,8 @@ DEFAULT: dict = {
 # 前端设置里的 key（`feature_settings` 表）→ 本地配置的路径。
 # 登记表就是**白名单**：不在表里的 key 一律忽略，免得前端顺手改了别的项。
 REMOTE_KEYS: dict[str, tuple[str, ...]] = {
+    'bridge.basic_mode': ('bridge', 'basic_mode'),
+    'bridge.selection_required': ('bridge', 'selection_required'),
     **{f'proactive.{key}': ('proactive', key) for key in (
         'enabled', 'account_index', 'persona_id', 'min_minutes', 'max_minutes',
         'daily_limit', 'start_hour', 'end_hour', 'bilibili', 'run_tokens', 'day_tokens',
@@ -214,9 +214,7 @@ REMOTE_KEYS: dict[str, tuple[str, ...]] = {
     "sticker.library": ("sticker", "library"),
     "sticker.library_session": ("sticker", "library_session"),
     "tools.enabled": ("tools", "enabled"),
-    "tools.root": ("tools", "root"),
     "tools.allow": ("tools", "allow"),
-    "tools.max_bytes": ("tools", "max_bytes"),
     "tools.require_owner": ("tools", "require_owner"),
     "sync.to_frontend": ("sync", "to_frontend"),
     "sync.to_qq": ("sync", "to_qq"),
@@ -307,7 +305,11 @@ def accounts(cfg: dict | None = None) -> list[dict]:
     - 某号没写 `groups` / `private` / `ws_url` → `None`，由调用方回落到顶层那份。
     """
     cfg = cfg if cfg is not None else load()
+    if (cfg.get('bridge') or {}).get('selection_required'):
+        return []
     rows = [row for row in (cfg.get("accounts") or []) if isinstance(row, dict) and row.get("enabled", True)]
+    if (cfg.get('bridge') or {}).get('basic_mode'):
+        rows = rows[:1]
     if not rows:
         return [{
             "name": "默认", "self_id": str((cfg.get("onebot") or {}).get("self_id") or ""),

@@ -13,6 +13,16 @@ from qqbridge.conversation import ConversationFlow
 
 
 class AccountLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_basic_policy_caps_connections_and_pauses_pending_selection(self):
+        updated = copy.deepcopy(self.cfg)
+        updated['accounts'].append({'self_id': '22222', 'ws_url': 'ws://127.0.0.1:3101/'})
+        updated['bridge'] = {'basic_mode': True}
+        await self.bridge.sync_accounts(updated)
+        self.assertEqual(len(self.bridge.accounts), 1)
+        updated['bridge']['selection_required'] = True
+        await self.bridge.sync_accounts(updated)
+        self.assertEqual(self.bridge.accounts, [])
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

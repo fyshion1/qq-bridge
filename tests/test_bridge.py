@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -440,57 +441,20 @@ class SettingsMergeTests(unittest.TestCase):
         self.assertEqual(config_mod.apply_remote(cfg())["allow"]["groups"], ["555"])
 
 
-class LocalToolTests(unittest.TestCase):
-    """本地小工具：给能力 + 画硬边界（大老大：「可以碰一下，只要别搞坏东西」）。"""
+class RetiredFileToolTests(unittest.TestCase):
+    def test_old_permissions_cannot_restore_removed_file_tools(self):
+        from qqbridge import tools
+        config = cfg(tools={'enabled': True, 'allow': ['dir', 'read', 'find', 'info']})
+        self.assertEqual(tools.allowed_names(config), [])
+        self.assertEqual(tools.tool_schema(config), [])
+        for name in ('local_dir', 'local_read', 'local_find', 'local_info'):
+            self.assertFalse(tools.run(config, name, {})[0])
 
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        (self.root / "笔记.txt").write_text("今天要买牛奶", encoding="utf-8")
-        self.tools = __import__("qqbridge.tools", fromlist=["x"])
-        self.cfg = cfg(tools={"enabled": True, "root": str(self.root), "allow": ["dir", "read", "find"]})
-        # These tests exercise paths; actor authorization is tested separately.
-        self.cfg["tools"]["require_owner"] = False
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_read_inside_sandbox(self):
-        ok, out = self.tools.run(self.cfg, "local_read", {"path": "笔记.txt"})
-        self.assertTrue(ok, out)
-        self.assertIn("牛奶", out)
-
-    def test_escape_is_denied(self):
-        ok, out = self.tools.run(self.cfg, "local_read", {"path": "../../secret.txt"})
-        self.assertFalse(ok)
-        self.assertIn("越界", out)
-
-    def test_absolute_path_outside_is_denied(self):
-        ok, out = self.tools.run(self.cfg, "local_read", {"path": "C:/Windows/win.ini"})
-        self.assertFalse(ok)
-
-    def test_shell_metacharacters_are_denied(self):
-        for path in ("x | cat /etc/passwd", "a > b.txt", "a; rm -rf /"):
-            self.assertFalse(self.tools.run(self.cfg, "local_read", {"path": path})[0], path)
-
-    def test_unlisted_action_is_denied(self):
-        ok, out = self.tools.run(self.cfg, "local_rm", {"path": "."})
-        self.assertFalse(ok)
-        self.assertIn("没有", out)
-
-    def test_disabled_by_default(self):
-        self.assertFalse(self.tools.enabled(cfg()))
-        self.assertEqual(self.tools.allowed_names(cfg()), [])
-
-    def test_config_cannot_add_new_actions(self):
-        # 配置只能从登记表里**挑**名字，塞一个 rm 进去是没用的。
-        names = self.tools.allowed_names(cfg(tools={"enabled": True, "allow": ["rm", "dir"]}))
-        self.assertEqual(names, ["dir"])
-
-    def test_deleting_names_are_hardcoded_forbidden(self):
-        self.assertIn("rm", self.tools.FORBIDDEN)
-        self.assertIn("del", self.tools.FORBIDDEN)
-        self.assertIn("format", self.tools.FORBIDDEN)
+    def test_missing_tools_feature_does_not_break_bridge_import(self):
+        from qqbridge import tools
+        with patch.object(tools, 'runtime', return_value=None):
+            self.assertFalse(tools.enabled(cfg(tools={'enabled': True, 'allow': ['search']})))
+            self.assertEqual(tools.tool_schema(cfg()), [])
 
 
 class _FakeWS:

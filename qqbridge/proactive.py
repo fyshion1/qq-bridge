@@ -15,7 +15,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pydantic import Field
-from xiaotangren_tools import Arguments, Tool, ToolContext, ToolExecutor, ToolPolicy, ToolRegistry
 
 from . import config as config_mod
 from .brain import BrainError
@@ -31,8 +30,7 @@ def publish_allowed(gate, run_id):
                 and run_id in gate.get('publishable_runs', []))
 
 
-class BrowseArguments(Arguments):
-    interest: str = Field(default='', max_length=120)
+
 
 
 class Proactive:
@@ -110,9 +108,11 @@ class Proactive:
             return
         self.busy = True
         try:
+            gate = await asyncio.to_thread(self.bridge.brain.qq_exploration)
+            if gate.get('disabled'):
+                return
             await self.flush_activities()
             settings = self.bridge.cfg.get('proactive') or {}
-            gate = await asyncio.to_thread(self.bridge.brain.qq_exploration)
             if gate.get('qq_notify'):
                 runner = next((r for r in self.bridge.accounts if r.index == gate.get('qq_account_index') and self.eligible(r, settings, now_local(), scheduling=False, notification=True)), None)
                 if runner and await self.notify(runner, settings):
@@ -151,6 +151,12 @@ class Proactive:
         self.save()
 
     async def browse(self, runner, interest=''):
+        from .tools import runtime
+        if runtime() is None:
+            return []
+        from xiaotangren_tools import Arguments, Tool, ToolContext, ToolExecutor, ToolPolicy, ToolRegistry
+        class BrowseArguments(Arguments):
+            interest: str = Field(default='', max_length=120)
         registry = ToolRegistry()
         async def handler(arguments, context):
             return json.dumps(await self._browse(runner, arguments.interest), ensure_ascii=False)

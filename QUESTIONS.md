@@ -39,9 +39,9 @@
 **定了 SnowLuma。** 你先说「napcat 也不是那么熟哈，只是用过这个框架，用新框架更好就用新的呗。
 而且我更喜欢 snowluma 的名字，很接近 snowluna，很有意境」，于是我把 README 改成 SnowLuma 首选。
 
-一句话总结：**NapCat 和 SnowLuma 不是竞品** —— SnowLuma 复用 NapCat 的协议层
-（`OB11Protocol` / `BotAPI` / `EventParser`），对桥来说来的字节是一样的，**换网关不用改一行代码**。
-差别只在部署体验：SnowLuma 自带 Node 运行时、不装本机 QQNT、自带 WebUI；NapCat 靠本机 QQ 客户端 + 资料最多。
+一句话总结：**NapCat 和 SnowLuma 不是竞品** —— SnowLuma 提供自己的会话桥接运行时，参考 NapCat 等项目的实现思路；它与 NapCat 都可输出 OneBot v11。旧记录所称“复用协议层”不准确。
+对桥来说基础消息使用 OneBot v11；扩展 API 是否可用仍需分别检查。
+差别只在部署体验：SnowLuma 自带 Node 运行时、需要兼容版本的本机 QQNT、自带 WebUI；NapCat 靠本机 QQ 客户端 + 资料最多。
 
 **本机已经跑通了**（这套配置就是按 SnowLuma 写的）：
 

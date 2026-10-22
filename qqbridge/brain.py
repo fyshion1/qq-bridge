@@ -141,6 +141,9 @@ class BrainClient:
             'selected': selected, 'remote_group': str(remote_group).lower(), 'persona_id': persona_id, 'account': account}))
 
     def qq_exploration(self) -> dict:
+        mode = self._request('/api/expert')
+        if not mode.get('enabled') or not mode.get('autonomy_installed'):
+            return {'disabled': True, 'qq_notify': False, 'qq_account_index': None, 'stopped': True}
         return self._request('/api/qq-bridge/exploration')
 
     def exploration_claim(self, payload: dict) -> dict:

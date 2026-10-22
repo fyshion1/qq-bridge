@@ -188,7 +188,7 @@ class AccountRunner:
         else:
             self.log(f"[{self.label()}]    收这些：群 {groups or '（空）'} · 私聊 {private or '（空）'}")
         if tools.enabled(cfg):
-            self.log(f"[{self.label()}] 🧰 本地小工具开着：{tools.allowed_names(cfg)} @ {tools.sandbox_root(cfg)}"
+            self.log(f"[{self.label()}] 🧰 可选联网工具已开启：{tools.allowed_names(cfg)}"
                      + ("（只有大老大能用）" if (cfg.get("tools") or {}).get("require_owner", True) else "（谁都能用）"))
         asr = str((cfg.get("asr") or {}).get("engine") or "qq")
         if asr == "qq":
@@ -370,7 +370,7 @@ class AccountRunner:
         engine = str((self.cfg.get("asr") or {}).get("engine") or "qq")
         fallback = str((self.cfg.get("asr") or {}).get("fallback") or "none")
         if engine not in ('openai', 'local') and fallback not in ('openai', 'local'):
-            self.log(f"[{self.label()}] ℹ 收到语音，网关没给转写，外部识别已关闭 —— 按 [语音] 记下")
+            self.log(f"[{self.label()}] ⚠ 语音未转写：QQ 网关未返回文字，且未启用识别兜底。请在声音设置启用本地识别并检查依赖 —— 本轮按 [语音] 记下")
             return ""
         local = engine == 'local' or (engine == 'qq' and fallback == 'local')
         self.log(f"[{self.label()}] 🎧 开始{'本地' if local else '外部'}语音识别")
@@ -387,6 +387,8 @@ class AccountRunner:
             result = (await asyncio.to_thread(media.transcribe, self.brain, path, self.cfg)) or ""
             if result:
                 self.log(f"[{self.label()}] 🎧 {'本地' if local else '外部'}语音转写成功：{result}")
+            else:
+                self.log(f"[{self.label()}] ⚠ 语音未转写：{'本地' if local else '外部'}识别返回空文字，本轮不能按已听懂处理")
             return result
         except (BrainError, ValueError, OSError) as exc:
             self.log(f"[{self.label()}] ⚠ {'本地' if local else '外部'}语音识别失败：{exc}")
@@ -493,7 +495,7 @@ class AccountRunner:
         """带工具的一轮：**问大脑要决定，在本进程执行，最多来回几圈**。
 
         循环为什么要在这里转（而不是让大脑转）：执行权必须留在能看见沙箱的这个地方。
-        大脑那侧只回答「模型想调 local_read，参数是 …」，一个动作都不碰。
+        大脑那侧只回答「模型想调 web_search，参数是 …」，一个动作都不碰。
         """
         tool_context = tools.context_for(
             self.cfg, event.user_id, conversation_id=f"qq-{event.session_key}")

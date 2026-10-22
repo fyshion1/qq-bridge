@@ -112,10 +112,10 @@ def cmd_check(args) -> int:
           f"主动发概率 {sticker.get('reply_chance')} · 自动收集{'开' if sticker.get('auto_collect', True) else '关'} "
           f"· 库里 {len(sticker.get('library') or [])} 张")
     if tools.enabled(cfg):
-        print(f"本地小工具：**开着** —— 能做 {tools.allowed_names(cfg)}，只在 {tools.sandbox_root(cfg)} 里，"
+        print(f"可选联网工具：已开启 {tools.allowed_names(cfg)}，"
               + ("只有大老大能用" if (cfg.get("tools") or {}).get("require_owner", True) else "谁都能用 ⚠"))
     else:
-        print("本地小工具：关（大老大想让它碰本地文件时，在前端「小工具」里开，默认只读）")
+        print("可选联网工具：关闭（统一由小窝各端的联网开关授权）")
 
     brain = _client()
     print("== 大脑 ==")
