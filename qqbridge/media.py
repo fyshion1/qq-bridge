@@ -28,9 +28,9 @@ from urllib.parse import urlparse
 from . import config as config_mod
 from .brain import BrainClient, BrainError
 
-# 附件管道的上限（图片 20MB / 视频 100MB）。语音更小：QQ 语音条通常几十秒。
+# QQ 聊天上限与本地视频分析一致（图片 20MB / 视频 50MB）。
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_VIDEO_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
 MAX_VOICE_BYTES = 25 * 1024 * 1024
 
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
@@ -271,9 +271,11 @@ def transcribe(brain: BrainClient, path: Path, cfg: dict) -> str:
     asr = cfg.get("asr") or {}
     if not asr.get("enabled", True) or str(asr.get("engine") or "none") == "none":
         return ""
+    if asr.get('engine') == 'local' or (asr.get('engine') == 'qq' and asr.get('fallback') == 'local'):
+        return brain.transcribe_local(path)
     seconds = voice_seconds(path)
     if seconds and seconds > float(asr.get("max_seconds") or 120):
-        return ""
+        raise ValueError("语音时长超过识别上限")
     audio, produced = prepare_audio(path)
     try:
         base_url = str(asr.get("base_url") or "")
@@ -282,11 +284,12 @@ def transcribe(brain: BrainClient, path: Path, cfg: dict) -> str:
             provider = brain.api_config()
             base_url = base_url or str(provider.get("base_url") or "")
             api_key = api_key or str(provider.get("api_key") or "")
-        return brain.transcribe(audio, base_url=base_url, api_key=api_key,
+        text = brain.transcribe(audio, base_url=base_url, api_key=api_key,
                                 model=str(asr.get("model") or "whisper-1"),
                                 language=str(asr.get("language") or "zh"))
-    except (BrainError, ValueError):
-        return ""
+        if not text:
+            raise ValueError("语音识别接口返回空文字")
+        return text
     finally:
         if produced:
             _cleanup(audio)

@@ -35,6 +35,10 @@
     "prefix_remote": true
   },
   "reply": {
+    "debounce_seconds": 2.0,
+    "max_wait_seconds": 10.0,
+    "max_bubbles": 4,
+    "interval_seconds": 1.2,
     "chunk_chars": 400,
     "mention_sender_in_group": true
   },
@@ -60,11 +64,28 @@
     "max_seconds": 120
   },
   "sticker": {
+    "auto_describe": true,
     "enabled": true,
     "auto_collect": true,
     "reply_chance": 0.0,
     "library": [],
     "library_session": "single-dalaoda"
+  },
+  "proactive": {
+    "enabled": false,
+    "account_index": 0,
+    "persona_id": "",
+    "min_minutes": 90,
+    "max_minutes": 180,
+    "daily_limit": 3,
+    "start_hour": 10,
+    "end_hour": 23,
+    "bilibili": true,
+    "run_tokens": 12000,
+    "day_tokens": 24000,
+    "group_id": "",
+    "qzone": false,
+    "qzone_right": 64
   },
   "memory": {
     "enabled": true,

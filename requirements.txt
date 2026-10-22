@@ -1,0 +1,3 @@
+# Install the SDK wheel or local source first (see README). No backend imports.
+xiaotangren-tool-runtime==0.1.0
+aiohttp>=3.10,<4

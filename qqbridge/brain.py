@@ -48,14 +48,15 @@ class BrainClient:
     # ---- 底层 ----
 
     def _request(self, path: str, payload: dict | None = None, method: str | None = None,
-                 raw: bytes | None = None, content_type: str = "application/json"):
+                 raw: bytes | None = None, content_type: str = "application/json",
+                 timeout: float | None = None):
         body = raw if raw is not None else (None if payload is None else json.dumps(payload).encode("utf-8"))
         request = Request(
             self.base_url + path, data=body, method=method,
             headers={"Content-Type": content_type},
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - 已限制为本机 http
+            with urlopen(request, timeout=self.timeout if timeout is None else timeout) as response:  # noqa: S310 - 已限制为本机 http
                 return json.load(response)
         except OSError as exc:  # HTTPError 也是 OSError
             detail = ""
@@ -70,6 +71,10 @@ class BrainClient:
 
     def capabilities(self) -> dict:
         return self._request("/api/nest/capabilities")
+
+    def qq_tools(self, session: dict, actor_id: str, text: str, *, message_ids: list[str] | None = None) -> dict:
+        return self._request('/api/qq-bridge/tools', {'session': session,
+                             'actor_id': actor_id, 'text': text, 'message_ids': message_ids or []}, timeout=150)
 
     def api_config(self) -> dict:
         """本功能实际生效的模型配置（全局默认 + 本功能覆盖）。
@@ -106,8 +111,112 @@ class BrainClient:
             got = self._request(f"/api/nest/features/{FEATURE_ID}/settings") or {}
         except BrainError:
             return {}
-        values = got.get("values")
+        # Newer brains distinguish saved/runtime overrides from schema defaults.
+        # Fall back to values for compatibility with an older brain.
+        values = got.get("overrides", got.get("values"))
         return values if isinstance(values, dict) else {}
+
+    def save_settings(self, values: dict) -> dict:
+        """合并后写回设置；读取失败时不写，避免清空其他前端配置。"""
+        path = f"/api/nest/features/{FEATURE_ID}/settings"
+        current = self._request(path)
+        if not isinstance(current, dict) or not isinstance(current.get("values"), dict):
+            raise BrainError("大脑返回的设置格式不正确，取消写回")
+        return self._request(path, {"values": {**current["values"], **values}}, method="PUT")
+
+    def group_session(self, persona_id: str = "") -> dict:
+        return self._request("/api/qq-bridge/group-session?" + urlencode({"persona_id": persona_id}))
+
+    def qq_context(self, selected: str, remote_group: bool = False, persona_id: str = "") -> dict:
+        return self._request("/api/qq-bridge/context?" + urlencode({
+            "selected": selected, "remote_group": str(remote_group).lower(), "persona_id": persona_id}))
+
+    def qq_proactive(self, payload: dict) -> dict:
+        # Planning (55s), bounded agent (60s), snapshot and cleanup can share
+        # one response. This changes the HTTP wait, never the sandbox budget.
+        return self._request('/api/qq-bridge/proactive', payload, timeout=max(self.timeout, 150.0))
+
+    def qq_account_context(self, selected: str, remote_group: bool, persona_id: str, account: int) -> dict:
+        return self._request('/api/qq-bridge/context?' + urlencode({
+            'selected': selected, 'remote_group': str(remote_group).lower(), 'persona_id': persona_id, 'account': account}))
+
+    def qq_exploration(self) -> dict:
+        return self._request('/api/qq-bridge/exploration')
+
+    def exploration_claim(self, payload: dict) -> dict:
+        return self._request('/api/qq-bridge/exploration-outbox/claim', payload)
+
+    def sandbox_signal(self, payload: dict) -> dict:
+        return self._request('/api/qq-bridge/sandbox/signal', payload)
+
+    def exploration_ack(self, run_id: str, sent: bool) -> dict:
+        return self._request('/api/qq-bridge/exploration-outbox/ack', {'run_id': run_id, 'sent': sent})
+
+    def qq_exploration_stop(self) -> dict:
+        return self._request('/api/qq-bridge/exploration/stop', {})
+
+    def activity_event(self, payload: dict) -> dict:
+        return self._request('/api/memory/events', payload)
+
+    def scout_directive(self) -> dict:
+        return self._request('/api/nest/features/bilibili_scout/directive') or {}
+
+    def qq_inbound(self, payload: dict) -> dict:
+        return self._request("/api/qq-bridge/inbound", payload)
+
+    def qq_web_sync(self, payload: dict) -> dict:
+        return self._request('/api/qq-bridge/web-sync', payload)
+
+    def qq_reply(self, payload: dict) -> dict:
+        # 后端整轮硬期限360秒，额外留30秒回传错误；不改变普通本机API超时。
+        return self._request("/api/qq-bridge/reply", payload, timeout=max(self.timeout, 390.0))
+
+    async def qq_reply_stream(self, payload: dict):
+        """Read local NDJSON one complete event at a time; never fall back/retry."""
+        import asyncio
+        request = Request(self.base_url + '/api/qq-bridge/reply-stream',
+                          data=json.dumps(payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
+        response = None
+        try:
+            response = await asyncio.to_thread(urlopen, request, timeout=45)
+            while True:
+                line = await asyncio.to_thread(response.readline)
+                if not line:
+                    break
+                item = json.loads(line)
+                if item.get('type') == 'error':
+                    raise BrainError(str(item.get('message') or '流式回复未完成'))
+                yield item
+        except (OSError, ValueError) as exc:
+            raise BrainError('本地流式连接未完成：' + type(exc).__name__ + '；不自动重试') from exc
+        finally:
+            if response is not None:
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(response.close), 2)
+                except TimeoutError:
+                    pass  # A blocked reader finishes under its own 45-second socket timeout.
+
+    def qq_delivered(self, payload: dict) -> dict:
+        return self._request("/api/qq-bridge/delivered", payload)
+
+    def qq_finish(self, session: dict, auto_memory: bool = True) -> dict:
+        return self._request("/api/qq-bridge/finish", {"session": session, "auto_memory": auto_memory})
+
+    def qq_lease(self, session: dict) -> dict:
+        return self._request('/api/qq-bridge/lease', session)
+
+    def qq_describe_stickers(self) -> dict:
+        return self._request("/api/qq-bridge/stickers/describe", {})
+
+    def group_turn(self, session: dict, text: str, request_id: str, *,
+                   images: list[str] | None = None, attachment: str = "", auto_memory: bool = True) -> dict:
+        """普通群聊的另一入口：同一历史、提示词、身份与每日记忆流程。"""
+        return self._request("/api/chat/session/turn", {
+            "feature_id": FEATURE_ID, "character_id": session["character_ids"][0],
+            "mode": "group", "session_id": session["session_id"],
+            "persona_id": session["persona_id"], "text": text,
+            "request_id": request_id, "images": images or [], "attachment": attachment, "auto_memory": auto_memory,
+        })
 
     def chat(
         self,
@@ -119,12 +228,17 @@ class BrainClient:
         state: dict | None = None,
         conversation_id: str = "",
         max_tokens: int = 1024,
+        memory_recall: bool = False,
     ) -> dict:
         """让一位（或多位）小糖人说话。messages 是 [{"role","content"}]。
 
         images 是 **data URL** 列表（≤8 张，如 `data:image/png;base64,…`）；
         传了就走该功能的视觉路（qq_bridge 在注册表里声明了 needs_vision=True）。
         裸 base64 会被 vsllm 这类中转打成 400 —— 必须带 `data:` 前缀。
+
+        memory_recall=True 时大脑会像普通聊天一样召回长期记忆（家记忆 + 在场角色个人记忆）。
+        QQ 桥默认开着：和群聊 / 私聊是同一个大脑，不该换个入口就失忆。
+        召回的是日常聊天那一桶记忆；`memory.isolate` 只影响写入（提炼进哪个命名空间）。
         """
         payload = {
             "feature_id": FEATURE_ID,
@@ -139,6 +253,8 @@ class BrainClient:
             payload["character_ids"] = list(character_ids)
         if images:
             payload["images"] = list(images)
+        if memory_recall:
+            payload["memory_recall"] = True
         return self._request("/api/nest/chat", payload)
 
     # ---- 带工具的一轮（§9.6.6）----
@@ -256,6 +372,12 @@ class BrainClient:
         return audio, "mp3"
 
     # ---- 语音（入）：语音转文字 ----
+
+    def transcribe_local(self, path: str | Path) -> str:
+        result = self._request('/api/media/audio/transcribe-local', method='POST',
+                               raw=Path(path).read_bytes(), content_type='application/octet-stream',
+                               timeout=180)
+        return str(result.get('text') or '').strip()
 
     def transcribe(self, path: str | Path, *, base_url: str = "", api_key: str = "",
                    model: str = "whisper-1", language: str = "zh") -> str:

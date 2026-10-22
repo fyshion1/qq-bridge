@@ -161,8 +161,8 @@ class Router:
         """
         if self._persona:
             return self._persona
-        name = str(self.override or self.account.get("persona")
-                   or ((self.cfg.get("persona") or {}).get("character_id")) or "").strip()
+        inherited = '' if self.account.get('independent_persona') else (self.cfg.get('persona') or {}).get('character_id')
+        name = str(self.override or self.account.get("persona") or inherited or "").strip()
         if not name:
             roster = self._roster or self.refresh_roster()
             if roster:
@@ -178,6 +178,8 @@ class Router:
 
     def persona_name(self) -> str:
         pid = self.persona()
+        if pid == "group":
+            return "群聊（按小窝当前在场成员）"
         for item in self._roster:
             if item.get("id") == pid:
                 return str(item.get("name") or pid)
@@ -228,8 +230,8 @@ class Router:
             return silent
         # 白名单里的会话**一律同步进前端**（大老大要能在小窝里看见 QQ 里聊了什么），
         # 哪怕这条不 @ 我、哪怕这个会话设了静音 —— 同步是记录，不是打扰。
-        session = "group" if event.is_group else f"single-{character_id}"
-        kind = "group" if event.is_group else "single"
+        session = "group" if event.is_group or character_id == "group" else f"single-{character_id}"
+        kind = "group" if event.is_group or character_id == "group" else "single"
         if not self.seen.check(event.message_id):
             return Route(True, False, session, kind, character_id, "这条消息已经同步过了（重放）")
         mode = ((self.cfg.get("modes") or {}).get("group" if event.is_group else "dm") or "chat")
@@ -251,6 +253,9 @@ class Router:
 
     def mentions_name(self, event: Event) -> bool:
         """消息文本里有没有直接叫本账号那位小糖人的名字（兜住「@ 被吞成文本」的情况）。"""
+        if self.persona() == "group":
+            return any(len(str(c.get("name") or "")) >= 2 and c["name"] in event.plain_text()
+                       for c in self._roster)
         name = self.persona_name()
         if not name or name == "?" or len(name) < 2:
             return False

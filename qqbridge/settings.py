@@ -42,7 +42,7 @@ class SettingsSync:
                 self.log(f"ℹ 没能从大脑读到前端设置（用本地 config.json 照跑）：{exc}")
             return config_mod.REMOTE
         # 只留登记过的 key（前端将来加了新字段、桥这边还没更新时不会误用）。
-        clean = {k: v for k, v in (values or {}).items() if k in config_mod.REMOTE_KEYS}
+        clean = {k: v for k, v in (values or {}).items() if k in config_mod.REMOTE_KEYS or k == 'accounts'}
         if clean != self._last:
             changed = sorted(set(clean) ^ set(self._last or {}))
             self._last = clean

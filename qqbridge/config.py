@@ -70,11 +70,16 @@ DEFAULT: dict = {
         "tools": None,           # None = 跟 tools.require_owner 走
     },
     "sync": {
+        "to_qq": True,           # 网页新消息同步到该账号最近使用的同身份 QQ 会话
         "to_frontend": True,     # QQ 里聊的同步进前端聊天记录（群聊 → group，私聊 → single-<角色>）
         "persona_id": "",        # 留空 = 默认身份（大老大）；填了会加 `<身份>@` 前缀
         "prefix_remote": True,   # 对方昵称作前缀写进内容，免得前端看不出谁在说话
     },
     "reply": {
+        "debounce_seconds": 2.0,      # 连续文字/表情在停顿后合为一轮
+        "max_wait_seconds": 10.0,     # 不无限等待续发
+        "max_bubbles": 4,
+        "interval_seconds": 1.2,
         "chunk_chars": 400,           # 长回复按这个长度切条发（QQ 单条有上限）
         "mention_sender_in_group": True,  # 群里回话时 @ 一下说话的人
     },
@@ -98,6 +103,9 @@ DEFAULT: dict = {
         # none   = 不识别，收到就记 [语音]。
         # 大老大批注：「ASR 用 QQ 的，按项目的来，qq 有转写的」。
         "engine": "qq",
+        # qq 没有返回转写时，自动用已配置的兼容 /audio/transcriptions 接口兜底。
+        # 设为 none 可关闭；这会产生一次音频识别请求并可能计费。
+        "fallback": "local",
         "base_url": "",          # 留空 = 用大脑给这个功能配的 base_url
         "api_key": "",           # 留空 = 用大脑那份 key（不落盘到别处）
         "model": "whisper-1",
@@ -105,6 +113,7 @@ DEFAULT: dict = {
         "max_seconds": 120,      # 超长语音不转写（省 token，也不做录音长期留存）
     },
     "sticker": {
+        "auto_describe": True,       # 原图只自动标注一次；不写长期记忆
         "enabled": True,
         "auto_collect": True,    # 收到别人的表情就学下来
         # 0 = 不主动发（只在你点名要的时候发）。大老大喜欢小糖人的表情包，可往上调。
@@ -114,23 +123,38 @@ DEFAULT: dict = {
         "library": [],
         "library_session": "single-dalaoda",
     },
+    "proactive": {
+        "enabled": False,
+        "account_index": 0,
+        "persona_id": "",
+        "min_minutes": 90,
+        "max_minutes": 180,
+        "daily_limit": 3,
+        "start_hour": 10,
+        "end_hour": 23,
+        "bilibili": True,
+        "run_tokens": 12000,
+        "day_tokens": 24000,
+        "group_id": "",
+        "qzone": False,
+        "qzone_right": 64,
+    },
     "memory": {
         "enabled": True,
-        "isolate": False,        # False = 汇入普通记忆（大老大批注：QQ 聊的日常也记得）
-        "window": 24,            # 攒够多少条提一次
-        # 静了这么久没说话就提炼（秒）。**别指望「关后端时提炼」** —— 前端「停止」
-        # 走的是 process.terminate()，Windows 上不会变成 SIGINT，那个 finally 压根不跑
-        # （日志里「收工，QQ 桥停了」一直是 0 次）。所以靠这条兜底，5 分钟不说话就收。
+        # 以下三项仅保留给旧兼容方法；正常运行统一走本体每日记忆流程。
+        "isolate": False,
+        "window": 24,
         "idle_seconds": 300,
     },
     # 本地小工具（大老大：「不碰本地工具的话，我倒是希望他能碰一下，只要别搞坏东西」）。
     # 默认**关**。开了之后：只在 root 里活动 + 只跑登记表里的动作 + 危险操作永久拒绝。
-    # ⚠ `allow` 里只能写 `tools.ACTIONS` 里有的名字（dir / read / find / info）——
-    #    配置只能从登记表里**挑**，加不进新动作（写了个不存在的名字就是没这一项）。
+    # ⚠ `allow` 里只能写登记表里有的名字：dir / read / find / info（本地只读），
+    #    以及 search（联网搜索，走 omnireach）。配置只能从登记表里**挑**，
+    #    加不进新动作（写了个不存在的名字就是没这一项）。
     "tools": {
         "enabled": False,
         "root": "",              # 留空 = data/sandbox/（第一次开的时候自动建）
-        "allow": ["dir", "read", "find", "info"],
+        "allow": ["dir", "read", "find", "info", "search"],
         "max_bytes": 8000,       # 单次读多少字（截断，免得烧 token）
         "require_owner": True,   # 只有大老大的消息能触发
         "max_turns": 3,          # 一轮里最多来回几次（防模型钻牛角尖）
@@ -149,6 +173,15 @@ DEFAULT: dict = {
 # 前端设置里的 key（`feature_settings` 表）→ 本地配置的路径。
 # 登记表就是**白名单**：不在表里的 key 一律忽略，免得前端顺手改了别的项。
 REMOTE_KEYS: dict[str, tuple[str, ...]] = {
+    **{f'proactive.{key}': ('proactive', key) for key in (
+        'enabled', 'account_index', 'persona_id', 'min_minutes', 'max_minutes',
+        'daily_limit', 'start_hour', 'end_hour', 'bilibili', 'run_tokens', 'day_tokens',
+        'group_id', 'qzone', 'qzone_right')},
+    "reply.debounce_seconds": ("reply", "debounce_seconds"),
+    "reply.max_wait_seconds": ("reply", "max_wait_seconds"),
+    "reply.max_bubbles": ("reply", "max_bubbles"),
+    "reply.interval_seconds": ("reply", "interval_seconds"),
+    "sticker.auto_describe": ("sticker", "auto_describe"),
     "persona.character_id": ("persona", "character_id"),
     "onebot.self_id": ("onebot", "self_id"),
     "onebot.mode": ("onebot", "mode"),
@@ -170,6 +203,7 @@ REMOTE_KEYS: dict[str, tuple[str, ...]] = {
     "voice.max_chars": ("voice", "max_chars"),
     "voice.max_per_minute": ("voice", "max_per_minute"),
     "asr.engine": ("asr", "engine"),
+    "asr.fallback": ("asr", "fallback"),
     "asr.base_url": ("asr", "base_url"),
     "asr.api_key": ("asr", "api_key"),
     "asr.model": ("asr", "model"),
@@ -185,8 +219,10 @@ REMOTE_KEYS: dict[str, tuple[str, ...]] = {
     "tools.max_bytes": ("tools", "max_bytes"),
     "tools.require_owner": ("tools", "require_owner"),
     "sync.to_frontend": ("sync", "to_frontend"),
+    "sync.to_qq": ("sync", "to_qq"),
     "sync.persona_id": ("sync", "persona_id"),
     "memory.isolate": ("memory", "isolate"),
+    "memory.enabled": ("memory", "enabled"),
     "memory.idle_seconds": ("memory", "idle_seconds"),
     "events.poke": ("events", "poke"),
     "events.notice": ("events", "notice"),
@@ -285,6 +321,7 @@ def accounts(cfg: dict | None = None) -> list[dict]:
             "name": str(row.get("name") or f"号{index + 1}"),
             "self_id": str(row.get("self_id") or ""),
             "persona": str(row.get("persona") or ""),
+            "independent_persona": True,
             # 没写端口就依次排开（3010 / 3011 …）—— 反向 WS 每个号必须占一个端口。
             "listen_port": int(row["listen_port"]) if row.get("listen_port") else base_port + index,
             "access_token": row.get("access_token"),   # None = 用顶层那个

@@ -33,18 +33,22 @@ import random
 import shutil
 import signal
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 
 from . import config as config_mod
-from . import media, onebot, tools
+from . import forwards, media, onebot, tools
 from .brain import BrainClient, BrainError
 from .onebot import Event, Notice, OneBotClient
 from .sessions import Router
 from .settings import SettingsSync
+from .conversation import ConversationFlow
+from .proactive import Proactive
 
-# 一次最多送几张图给模型（token 安全线，和本体的 8 张抽帧同一档）。
-MAX_IMAGES_PER_TURN = 4
+# 图片与视频帧共享 10 张视觉预算；每条消息最多一个视频，只走本地抽帧。
+MAX_IMAGES_PER_TURN = 10
+MAX_VIDEO_FRAMES = 8
 # 群聊里聊过多少条之后，前面的话就不带了（省 token，也不至于忘得太快）。
 HISTORY_TURNS = 16
 
@@ -105,14 +109,23 @@ class AccountRunner:
         self.persona_override = ""      # 启动参数 `--characters`（小窝前端「这个号演谁」）
         tag = self.account.get("self_id") or f"号{index + 1}"
         self.history = History(config_mod.state_file(f"conversations-{tag}.json"))
-        self.client = OneBotClient(self._client_cfg(cfg), self.handle, self.log, on_notice=self.on_notice)
+        self.client = OneBotClient(
+            self._client_cfg(cfg), self.receive,
+            lambda message: self.log(f"[QQ {self.account.get('self_id') or self.label()}] {message}"),
+            on_notice=self.on_notice)
+        self.connection_key = json.dumps(self._client_cfg(cfg).get('onebot', {}), sort_keys=True)
         self._voice_times: deque[float] = deque()
         self._last_images: list[str] = []
         self._poke_seen: dict[str, float] = {}
+        self.flow = ConversationFlow(self)
+
+    async def receive(self, event: Event) -> None:
+        """常驻入口：只做入站安排，生成和发送由会话队列执行。"""
+        await self.flow.accept(event)
 
     # ---- 账号 → 这份连接用的配置 ----
 
-    def _client_cfg(self, cfg: dict) -> dict:
+    def _client_cfg(self, cfg: dict, account: dict | None = None) -> dict:
         """把「这个号的」端口 / token / self_id / 网关地址铺到通用配置上。
 
         - 反向 WS（`mode=server`）：每个号必须占一个**不同端口**，网关那边也按端口配；
@@ -120,15 +133,16 @@ class AccountRunner:
           SnowLuma 是「一个 QQ 号一个 ws server 端口」，所以 `ws_url` 也得一号一份。
         """
         out = json.loads(json.dumps(cfg))
+        account = self.account if account is None else account
         ob = out.setdefault("onebot", {})
-        if self.account.get("listen_port"):
-            ob["listen_port"] = int(self.account["listen_port"])
-        if self.account.get("ws_url"):
-            ob["ws_url"] = str(self.account["ws_url"])
-        if self.account.get("access_token") is not None:
-            ob["access_token"] = self.account.get("access_token") or ""
-        if self.account.get("self_id"):
-            ob["self_id"] = str(self.account["self_id"])
+        if account.get("listen_port"):
+            ob["listen_port"] = int(account["listen_port"])
+        if account.get("ws_url"):
+            ob["ws_url"] = str(account["ws_url"])
+        if account.get("access_token") is not None:
+            ob["access_token"] = account.get("access_token") or ""
+        if account.get("self_id"):
+            ob["self_id"] = str(account["self_id"])
         return out
 
     def apply(self, cfg: dict, account: dict) -> None:
@@ -138,11 +152,13 @@ class AccountRunner:
         改不了的：**端口 / QQ 号**（那是连接本身），改了会明确提示要重启。
         """
         old = dict(self.account)
+        old_persona = old.get("persona") or (self.cfg.get("persona") or {}).get("character_id")
         self.cfg = cfg
         self.account = dict(account)
         self.router.cfg = cfg
         self.router.account = self.account
-        if str(self.account.get("persona") or "") != str(old.get("persona") or ""):
+        new_persona = self.account.get("persona") or (cfg.get("persona") or {}).get("character_id")
+        if new_persona != old_persona:
             self.router.reset_persona()
             self.log(f"[{self.label()}] 换人了 → 现在演「{self.router.persona_name()}」")
         if str(self.account.get("listen_port") or "") != str(old.get("listen_port") or "") \
@@ -197,6 +213,23 @@ class AccountRunner:
             return
 
         session_id = route.frontend_session
+        group_session = None
+        if route.character_id == "group":
+            try:
+                group_session = await asyncio.to_thread(
+                    self.brain.group_session, str((self.cfg.get("sync") or {}).get("persona_id") or ""))
+            except BrainError as exc:
+                self.log(f"[{self.label()}] ⚠ 没能读取群聊成员与身份：{exc}")
+                return
+            # 叫名字只认本轮仍在场的人，不让已离场角色触发回话。
+            roster = await asyncio.to_thread(self.brain.characters)
+            self.router._roster = [c for c in roster if c.get("id") in group_session["character_ids"]]
+            if route.reason in ("", "群里没 @ 我：只同步，不插嘴") and event.is_group and not event.mentions_me() and (self.cfg.get("allow") or {}).get("require_mention_in_group", True):
+                owner = str((self.cfg.get("owner") or {}).get("qq") or "")
+                bypass = bool(owner) and event.user_id == owner and (self.cfg.get("owner") or {}).get("whitelist_bypass", True)
+                if not bypass:
+                    route.reply = self.router.mentions_name(event) and (self.cfg.get("modes") or {}).get("group") != "silent"
+        event = await forwards.expand_event(self.client, event)
         text = event.plain_text()
         # 语音先转写：转不出字就只剩「[语音]」，也不装懂。
         voice_text, media_items = await self._collect_media(event, session_id)
@@ -204,11 +237,16 @@ class AccountRunner:
             text = (text.replace("[语音]", f"[语音] {voice_text}") if text else f"[语音] {voice_text}")
 
         prefix = self._prefix(event)
+        if group_session is not None and route.reply:
+            await self._reply_group(event, group_session, prefix + (text or "[附件]"), media_items)
+            return
         self.log(f"[{self.label()}] ← {event.session_key} {event.display_name}："
                  f"{(text or '（只有媒体）')[:40]}")
-        await self._sync_inbound(session_id, prefix, text, media_items)
-        self.router.remember(event.session_key, route.session_kind, route.character_id,
-                             self._speaker(event), text or "[发了点东西]")
+        await self._sync_inbound(session_id, prefix, text, media_items,
+                                 target_session=group_session["session_id"] if group_session else "")
+        if group_session is None:
+            self.router.remember(event.session_key, route.session_kind, route.character_id,
+                                 self._speaker(event), text or "[发了点东西]")
         if not route.reply:
             return
         await self._reply(event, route, session_id, text, media_items)
@@ -242,37 +280,55 @@ class AccountRunner:
         transcript = ""
         items: list[dict] = []
         images_for_model: list[str] = []
+        counts = {"image": 0, "video": 0, "record": 0}
         for seg in event.media():
-            if len(items) >= MAX_IMAGES_PER_TURN + 2:
-                break
             kind = str(seg.get("type"))
+            category = "image" if kind in {"image", "mface"} else kind
+            limit = {"image": 10, "video": 1, "record": 4}.get(category)
+            if limit is not None:
+                if counts[category] >= limit:
+                    self.log(f"[{self.label()}] ℹ {category} 数量已达上限，跳过多余附件")
+                    continue
+                counts[category] += 1
             data = seg.get("data") or {}
             if kind == "face":       # QQ 自带小黄脸：没有文件，只有 id
                 continue
             if kind == "record":
-                transcript = await self._voice_in(seg, transcript, event.message_id)
+                transcript = await self._voice_in(seg, transcript, str(data.get("_forward_message_id") or event.message_id))
                 continue
             url = str(data.get("url") or data.get("file") or "")
             if not url:
                 continue
-            sticker = kind == "mface" or bool(media_cfg.get("treat_small_image_as_sticker", False))
+            sticker = kind == "mface"
             try:
-                saved, local = media.ingest(
+                saved, local = await asyncio.to_thread(media.ingest,
                     self.brain, session_id, url,
                     kind="video" if kind == "video" else ("sticker" if sticker else "image"))
             except (ValueError, BrainError) as exc:
                 self.log(f"[{self.label()}] ⚠ 一个{kind}没存下来：{exc}")
                 continue
             try:
+                if kind == "image" and (media_cfg.get("treat_small_image_as_sticker", False)
+                        or (self.cfg.get("sticker") or {}).get("treat_small_image_as_sticker", False)):
+                    width, height = int(saved.get("width") or 0), int(saved.get("height") or 0)
+                    sticker = 0 < max(width, height) <= 512 and local.stat().st_size <= 5 * 1024 * 1024
                 if kind == "video":
-                    frames, _ = media.video_frames(self.brain, url)
-                    images_for_model.extend(frames[: int(media_cfg.get("video_frames") or MAX_IMAGES_PER_TURN)])
+                    frames, _ = await asyncio.to_thread(media.video_frames, self.brain, local.resolve().as_uri())
+                    frame_limit = max(1, min(int(media_cfg.get("video_frames") or 4), MAX_VIDEO_FRAMES))
+                    frames = frames[:frame_limit]
+                    images_for_model.extend(frames)
                     item = {"type": "video", "url": saved.get("orig") or saved.get("thumb", ""),
                             "thumb": saved.get("thumb", "")}
                     if frames:
                         # 视频没有缩略图（save_video 的 thumb 指原文件）：把抽出来的第一帧
                         # 存成一张附件，当前端气泡的封面（库里只存引用，不存 base64）。
-                        item["thumb"] = media.upload_data_url(self.brain, session_id, frames[0]) or item["thumb"]
+                        item["frames"] = []
+                        for frame in frames:
+                            frame_url = await asyncio.to_thread(media.upload_data_url, self.brain, session_id, frame)
+                            if frame_url:
+                                item["frames"].append(frame_url)
+                        if item["frames"]:
+                            item["thumb"] = item["frames"][0]
                 else:
                     images_for_model.append(media.data_url(local))
                     item = {"type": "sticker" if sticker else "image",
@@ -297,30 +353,44 @@ class AccountRunner:
         3. `asr.engine=openai` → 下载语音 → 外部 whisper（音频过上游，要花钱）；
         4. 都没有 → 返回空串，调用方按 `[语音]` 记，**不假装听懂**。
         """
+        asr = self.cfg.get('asr') or {}
+        engine = str(asr.get('engine') or 'qq')
+        if not asr.get('enabled', True) or engine == 'none':
+            return ''
         given = onebot.text_of_record(seg)
         if given:
             self.log(f"[{self.label()}] 🎧 QQ 转写：{given[:40]}")
             return given
         if current:
             return current
-        asked = await self.client.ptt_text(message_id)
+        asked = await self.client.ptt_text(message_id) if engine == 'qq' else ''
         if asked:
             self.log(f"[{self.label()}] 🎧 QQ 转写（问网关要的）：{asked[:40]}")
             return asked
         engine = str((self.cfg.get("asr") or {}).get("engine") or "qq")
-        if engine != "openai":
-            self.log(f"[{self.label()}] ℹ 收到语音，网关没给转写，也没开外部识别 —— 按 [语音] 记下")
+        fallback = str((self.cfg.get("asr") or {}).get("fallback") or "none")
+        if engine not in ('openai', 'local') and fallback not in ('openai', 'local'):
+            self.log(f"[{self.label()}] ℹ 收到语音，网关没给转写，外部识别已关闭 —— 按 [语音] 记下")
             return ""
+        local = engine == 'local' or (engine == 'qq' and fallback == 'local')
+        self.log(f"[{self.label()}] 🎧 开始{'本地' if local else '外部'}语音识别")
         url = str((seg.get("data") or {}).get("url") or (seg.get("data") or {}).get("file") or "")
         if not url:
+            self.log(f"[{self.label()}] ⚠ 语音识别失败：网关未提供音频下载地址")
             return ""
         try:
-            path = media.download(url, max_bytes=media.MAX_VOICE_BYTES, ext=".amr")
+            path = await asyncio.to_thread(media.download, url, max_bytes=media.MAX_VOICE_BYTES, ext=".amr")
         except ValueError as exc:
             self.log(f"[{self.label()}] ⚠ 语音没下来：{exc}")
             return ""
         try:
-            return media.transcribe(self.brain, path, self.cfg) or ""
+            result = (await asyncio.to_thread(media.transcribe, self.brain, path, self.cfg)) or ""
+            if result:
+                self.log(f"[{self.label()}] 🎧 {'本地' if local else '外部'}语音转写成功：{result}")
+            return result
+        except (BrainError, ValueError, OSError) as exc:
+            self.log(f"[{self.label()}] ⚠ {'本地' if local else '外部'}语音识别失败：{exc}")
+            return ""
         finally:
             path.unlink(missing_ok=True)
 
@@ -335,8 +405,11 @@ class AccountRunner:
         url = str(saved.get("orig") or saved.get("thumb") or "")
         if not url:
             return
-        library = list((self.cfg.get("sticker") or {}).get("library") or [])
-        if url in library:
+        library = list(self.bridge._pending_settings.get("sticker.library")
+                       or (self.cfg.get("sticker") or {}).get("library") or [])
+        # 同一份原图在不同会话目录下 URL 不同，文件名是内容指纹。
+        fingerprint = url.rsplit('/', 1)[-1].split('.', 1)[0]
+        if any(u == url or u.rsplit('/', 1)[-1].split('.', 1)[0] == fingerprint for u in library):
             return
         library.append(url)
         del library[:-300]        # 最多记 300 个，够用了
@@ -344,6 +417,28 @@ class AccountRunner:
         self.log(f"[{self.label()}] 🎴 收下一个表情包")
 
     # ---- 回话 ----
+
+    async def _reply_group(self, event: Event, session: dict, text: str, items: list[dict]) -> None:
+        images = []
+        for item in items:
+            if item.get("frames"):
+                images.extend(item["frames"])
+                continue
+            url = str(item.get("thumb") if item.get("type") == "video" else item.get("url") or item.get("thumb") or "")
+            if url.startswith("/api/files/") and not (item.get("type") == "video" and url == item.get("url")):
+                images.append(url)
+        try:
+            result = await asyncio.to_thread(
+                self.brain.group_turn, session, text, "qq-" + uuid.uuid4().hex,
+                images=images[:MAX_IMAGES_PER_TURN], attachment=str((items[0] if items else {}).get("url") or ""),
+                auto_memory=bool((self.cfg.get("memory") or {}).get("enabled", True)))
+        except BrainError as exc:
+            self.log(f"[{self.label()}] ⚠ 群聊回复失败：{exc}")
+            return
+        reply = str((result.get("assistant") or {}).get("content") or "").strip()
+        if reply:
+            await self._send(event, reply)
+        # 本体已保存本轮并安排每日记忆整理，不再同步或调用旧提炼接口。
 
     async def _reply(self, event: Event, route, session_id: str, text: str, items: list[dict]) -> None:
         images = self._last_images
@@ -372,7 +467,7 @@ class AccountRunner:
             result = await asyncio.to_thread(
                 self.brain.chat, route.character_id, turns,
                 images=images, character_ids=[route.character_id],
-                conversation_id=f"qq-{event.session_key}",
+                conversation_id=f"qq-{event.session_key}", memory_recall=True,
             )
         except BrainError as exc:
             self.log(f"[{self.label()}] ⚠ 小糖人没能回话：{exc}")
@@ -394,13 +489,15 @@ class AccountRunner:
             return False
         return bool(owner) and event.user_id == owner
 
-    async def _reply_with_tools(self, route, event: Event, turns: list[dict], images: list[str]) -> str:
+    async def _reply_with_tools(self, route, event: Event, turns: list[dict], images: list[str], *, strict: bool = False) -> str:
         """带工具的一轮：**问大脑要决定，在本进程执行，最多来回几圈**。
 
         循环为什么要在这里转（而不是让大脑转）：执行权必须留在能看见沙箱的这个地方。
         大脑那侧只回答「模型想调 local_read，参数是 …」，一个动作都不碰。
         """
-        schema = tools.tool_schema(self.cfg)
+        tool_context = tools.context_for(
+            self.cfg, event.user_id, conversation_id=f"qq-{event.session_key}")
+        schema = tools.tool_schema(self.cfg, tool_context)
         state = {"note": tools.describe_for_model(self.cfg)}
         convo = [dict(m) for m in turns]
         max_turns = int((self.cfg.get("tools") or {}).get("max_turns") or 3)
@@ -413,6 +510,8 @@ class AccountRunner:
                     conversation_id=f"qq-{event.session_key}",
                 )
             except BrainError as exc:
+                if strict:
+                    raise
                 self.log(f"[{self.label()}] ⚠ 工具轮失败，改普通回话：{exc}")
                 return await self._reply_plain(route, event, turns, images)
             images = []       # 图只在第一轮带一次，后面轮次已经「看过」了
@@ -425,8 +524,13 @@ class AccountRunner:
                                           "function": {"name": c.get("name"), "arguments": c.get("arguments")}}
                                          for c in calls]})
             for call in calls:
-                ok, output = tools.run(self.cfg, str(call.get("name")), call.get("arguments") or "{}")
-                self.log(f"[{self.label()}] 🧰 {call.get('name')} → {'✓' if ok else '✗'} {output[:60]!r}")
+                context = tools.context_for(
+                    self.cfg, event.user_id, conversation_id=f"qq-{event.session_key}",
+                    call_id=str(call.get("id") or ""))
+                ok, output = await tools.arun(
+                    self.cfg, str(call.get("name")), call.get("arguments") or "{}", context,
+                    audit=lambda entry: self.log(
+                        f"[{self.label()}] tool_call {json.dumps(entry.__dict__, ensure_ascii=True)}"))
                 convo.append({"role": "tool", "tool_call_id": str(call.get("id") or ""),
                               "content": output[:4000]})
         return last_text or "（我想试着看看文件，但绕了几圈没绕明白）"
@@ -570,7 +674,7 @@ class AccountRunner:
             reply = random.choice(["呀，被你戳到了～", "在的在的，怎么啦？", "（被戳）诶？"])
             self.log(f"[{self.label()}] 👉 被戳了（{notice.user_id}）")
             await self._send(fake, reply, force_text=True)
-            await self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
+            await self._sync_inbound("group" if notice.is_group or self.router.persona() == "group" else f"single-{self.router.persona()}",
                                      self._prefix(fake), "（被戳了一下）", [])
             return
         if not events_cfg.get("notice", False):
@@ -579,7 +683,7 @@ class AccountRunner:
         if notice.is_group and notice.group_id not in self.router._groups():
             return
         self.log(f"[{self.label()}] 📝 {notice.describe()}")
-        await self._sync_inbound("group" if notice.is_group else f"single-{self.router.persona()}",
+        await self._sync_inbound("group" if notice.is_group or self.router.persona() == "group" else f"single-{self.router.persona()}",
                                  "", notice.describe(), [])
 
     # ---- 同步进前端 ----
@@ -598,15 +702,19 @@ class AccountRunner:
         persona = str(cfg.get("persona_id") or "")
         return f"{persona}@{session_id}" if persona and persona != "dalaoda" else session_id
 
-    async def _sync_inbound(self, session_id: str, prefix: str, text: str, items: list[dict]) -> None:
+    async def _sync_inbound(self, session_id: str, prefix: str, text: str, items: list[dict], *, target_session: str = "") -> None:
         """QQ 那边来人说的话 → 写进前端会话（群聊 → group，私聊 → single-<角色>）。"""
         if not (self.cfg.get("sync") or {}).get("to_frontend", True):
             return
-        target = self._persona_session(session_id)
+        target = target_session or self._persona_session(session_id)
         first = items[0] if items else None
         picture = str((first or {}).get("thumb") or (first or {}).get("url") or "")
         kind = "image" if str((first or {}).get("type") or "") in ("image", "sticker") else "text"
         try:
+            if self.router.persona() == "group" and not target_session:
+                session = await asyncio.to_thread(
+                    self.brain.group_session, str((self.cfg.get("sync") or {}).get("persona_id") or ""))
+                target = session["session_id"]
             await asyncio.to_thread(
                 self.brain.append_message, target, "user", f"{prefix}{text}".strip(),
                 image=picture, image_source="qq" if picture else "", kind=kind)
@@ -624,19 +732,10 @@ class AccountRunner:
     # ---- 定时活 ----
 
     def tick(self, *, shutdown: bool = False) -> None:
-        """定时活。`shutdown=True`（收工/被停掉）时**不管攒没攒够都把这段记忆交出去**——
-        「聊几句就关后端」这种用法靠这条才留得下东西（见 Router.flush_memory）。
-
-        **但别指望 shutdown 那条路**：前端「停止」走的是 `process.terminate()`，
-        Windows 上不会变成 SIGINT，这个分支实测一次都没跑到过。所以真正兜底的是
-        `flush_idle`：静了一会儿就提炼，不靠「谁想起来关一下」。
-        """
+        """保存路由状态、清理临时语音；当前记忆整理由 ConversationFlow 交给本体。"""
         self.history.save()
         self.router.save()
-        self.router.flush_memory(force=shutdown)
-        idle = float((self.cfg.get("memory") or {}).get("idle_seconds") or 0)
-        if idle > 0:
-            self.router.flush_idle(idle)
+        # 新入口由本体按持久消息做每日事件整理；不再触发旧版攒轮次提炼。
         self._prune_voice()
 
     def _prune_voice(self) -> None:
@@ -663,6 +762,56 @@ class Bridge:
         self.cfg = config_mod.load()
         self.accounts: list[AccountRunner] = []
         self._pending_settings: dict = {}      # 桥自己攒的改动（学到的表情包…），ticker 里写回
+        self.proactive = Proactive(self)
+        self._client_tasks: dict[AccountRunner, asyncio.Task] = {}
+        self._stop = asyncio.Event()
+
+    async def _start_account(self, runner):
+        runner.refresh_roster()
+        await runner.startup_log()
+        runner.flow._task(runner.flow.start())
+        self._connect_account(runner)
+
+    def _connect_account(self, runner):
+        task = asyncio.create_task(runner.client.run_forever())
+        self._client_tasks[runner] = task
+        def finished(t):
+            if not t.cancelled() and t.exception():
+                self.log(f'[{runner.label()}] ⚠ QQ 连接任务异常退出：{type(t.exception()).__name__}，下次心跳重连')
+        task.add_done_callback(finished)
+
+    async def _stop_account(self, runner):
+        await runner.flow.close()
+        runner.client.stop()
+        task = self._client_tasks.pop(runner, None)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        runner.tick(shutdown=True)
+
+    async def sync_accounts(self, cfg):
+        """Keep unchanged connections alive; start/stop only changed account slots."""
+        rows = config_mod.accounts(cfg)
+        old = self.accounts
+        keep = {}
+        for index, runner in enumerate(old):
+            if index < len(rows) and runner.connection_key == json.dumps(runner._client_cfg(cfg, rows[index]).get('onebot', {}), sort_keys=True):
+                keep[index] = runner
+            else:
+                await self._stop_account(runner)
+        self.cfg = cfg
+        self.accounts = []
+        for index, row in enumerate(rows):
+            runner = keep.get(index)
+            if runner:
+                runner.apply(cfg, row)
+            else:
+                runner = AccountRunner(self, cfg, row, index)
+                if index == 0 and self.persona_override:
+                    runner.persona_override = self.persona_override
+                await self._start_account(runner)
+            self.accounts.append(runner)
+        self.log(f'⚙ QQ 账号配置已同步：{len(self.accounts)} 个号，连接变更自动生效')
 
     # ---- 组装 ----
 
@@ -690,6 +839,8 @@ class Bridge:
         try:
             saved = await asyncio.to_thread(self.brain.save_settings, payload)
         except BrainError as exc:
+            # 留到下一轮重试；等待期间新排队的同名设置优先。
+            self._pending_settings = {**payload, **self._pending_settings}
             self.log(f"⚠ 没能把设置写回大脑：{exc}")
             return
         values = (saved or {}).get("values") or {}
@@ -705,7 +856,7 @@ class Bridge:
         self.check_startup()
         self.build()
         loop = asyncio.get_running_loop()
-        stop_all = lambda: [r.client.stop() for r in self.accounts]  # noqa: E731
+        stop_all = self._stop.set
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, stop_all)
@@ -714,17 +865,17 @@ class Bridge:
         self.log(f"💬 QQ 桥起来了：{len(self.accounts)} 个号。"
                  f"设置来自{'小窝前端' if config_mod.REMOTE else '本地 config.json'}。")
         for runner in self.accounts:
-            runner.refresh_roster()
-            await runner.startup_log()
+            await self._start_account(runner)
         self.log("   想改白名单 / 演谁 / 语音 / 表情包 → 小窝前端「💬 QQ 桥设置」，改完不用重启。")
         try:
-            await asyncio.gather(*(r.client.run_forever() for r in self.accounts), self._ticker())
+            await self._ticker()
         except asyncio.CancelledError:
             raise
         finally:
             for runner in self.accounts:
-                runner.tick(shutdown=True)
+                await self._stop_account(runner)
             await self._flush_settings()
+
             self.log("收工，QQ 桥停了。")
 
     def check_startup(self) -> None:
@@ -741,20 +892,28 @@ class Bridge:
             self.log("ℹ 语音识别：先用 QQ 自带的转写；没有时走外部 whisper（会花钱、音频过上游）。")
 
     async def _ticker(self) -> None:
-        """每 30 秒做点慢活：拉前端设置、存历史、攒够的记忆交出去、清过期语音文件。"""
-        while True:
-            await asyncio.sleep(30)
+        """每 30 秒拉设置、重试待入库事件与送达回执、清理临时语音。"""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30)
+                break
+            except asyncio.TimeoutError:
+                pass
             before = dict(config_mod.REMOTE)
             self.settings.pull(quiet=True)
             if dict(config_mod.REMOTE) != before:
                 # 前端改了设置 → 每个号就地更新（演谁 / 白名单 / 语音…立刻生效）。
-                self.cfg = config_mod.load()
-                rows = config_mod.accounts(self.cfg)
-                for index, runner in enumerate(self.accounts):
-                    runner.apply(self.cfg, rows[index] if index < len(rows) else runner.account)
+                await self.sync_accounts(config_mod.load())
             for runner in self.accounts:
+                task = self._client_tasks.get(runner)
+                if task and task.done() and not self._stop.is_set():
+                    # Reconnect the transport only, never replay a model request.
+                    self._connect_account(runner)
                 runner.tick()
+                runner.flow._task(runner.flow.recover())
             await self._flush_settings()
+            if self.accounts and not self.proactive.busy:
+                self.accounts[0].flow._task(self.proactive.tick())
 
 
 def sticker_dir() -> Path:

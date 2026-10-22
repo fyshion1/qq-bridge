@@ -53,6 +53,9 @@ class FakeBrain:
     def api_config(self):
         return {"model": "fake", "base_url": "http://127.0.0.1:8000/v1", "api_key": "sk-x"}
 
+    def qq_tools(self, session, actor_id, text, *, message_ids=None):
+        return {'context': '', 'status': 'disabled'}
+
     def chat(self, character_id, messages, **kw):
         self.calls.append(("chat", character_id, kw.get("images")))
         return {"message": {"content": "回你一句"}}
@@ -446,6 +449,8 @@ class LocalToolTests(unittest.TestCase):
         (self.root / "笔记.txt").write_text("今天要买牛奶", encoding="utf-8")
         self.tools = __import__("qqbridge.tools", fromlist=["x"])
         self.cfg = cfg(tools={"enabled": True, "root": str(self.root), "allow": ["dir", "read", "find"]})
+        # These tests exercise paths; actor authorization is tested separately.
+        self.cfg["tools"]["require_owner"] = False
 
     def tearDown(self):
         self.tmp.cleanup()

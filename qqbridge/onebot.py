@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import ClientError, WSMsgType, web
 
 Handler = Callable[["Event"], Awaitable[None]]
 NoticeHandler = Callable[["Notice"], Awaitable[None]]
@@ -36,6 +36,12 @@ NoticeHandler = Callable[["Notice"], Awaitable[None]]
 
 class OneBotError(RuntimeError):
     pass
+
+
+# 连网关时**该重连**的异常。aiohttp 的 ClientError 不在 OSError 那支上
+# （WSServerHandshakeError 的 mro 是 ClientResponseError → ClientError → Exception），
+# 所以握手被拒（401）以前会直接穿出 run_forever，把整个桥打崩 —— 网关挂错号时必现。
+_CONNECT_ERRORS = (OSError, OneBotError, ClientError)
 
 
 # ---- 事件 ----
@@ -394,6 +400,22 @@ class OneBotClient:
                 return str(url)   # 有些网关回本地绝对路径，交给下载那头处理
         return ""
 
+    async def forward_messages(self, forward_id: str = "", *, message_id: str = "", timeout: float = 20) -> list[dict] | None:
+        """SnowLuma get_forward_msg returns data.messages (OneBot message events).
+
+        Prefer the forward segment resource id; message_id refers to its outer QQ
+        message, not to the resource id. None explicitly means unreadable.
+        """
+        params = {"id": forward_id} if forward_id else {"message_id": message_id}
+        if not (forward_id or message_id):
+            return None
+        result = await self.call("get_forward_msg", params, timeout=timeout)
+        data = result.get("data")
+        if result.get("retcode") != 0 or not isinstance(data, dict):
+            return None
+        messages = data.get("messages")
+        return messages if isinstance(messages, list) else None
+
     async def ptt_text(self, message_id: str) -> str:
         """问网关要这条语音的**转写文本**（SnowLuma 的 `fetch_ptt_text`）。
 
@@ -455,12 +477,34 @@ class OneBotClient:
             while not self._stop.is_set():
                 try:
                     await self._dial_once()
-                except (OSError, OneBotError) as exc:
-                    self.log(f"⚠ 和 QQ 网关的连接断了：{exc}；{self.reconnect_seconds}s 后重连")
+                except _CONNECT_ERRORS as exc:
+                    self.log(f"⚠ 和 QQ 网关的连接断了：{self._connect_hint(exc)}；"
+                             f"{self.reconnect_seconds}s 后重连")
                 self.connected.clear()
                 if self._stop.is_set():
                     break
                 await asyncio.sleep(self.reconnect_seconds)
+
+    def _connect_hint(self, exc: Exception) -> str:
+        """把「连不上」说得能照着修 —— 尤其是 401。
+
+        401 不是网络问题，是**网关认的不是我们要连的那个号**：SnowLuma 把每条 WS 服务
+        按 QQ 号分开存（`config/onebot_<号>.json`），每个号一个自己的 accessToken。
+        网关挂在 A 号上、桥配的是 B 号的 token 时，端口通、握手 401 —— 看着像 token 填错，
+        其实是**挂错号**了（网关只挂电脑上当前登录的那个 QQ）。
+        """
+        import aiohttp
+
+        if isinstance(exc, aiohttp.WSServerHandshakeError):
+            if exc.status == 401:
+                return (f"网关拒绝了（401，access_token 对不上）。多数情况不是 token 填错了，"
+                        f"而是**网关挂的不是这个号** —— SnowLuma 每个 QQ 号一份配置"
+                        f"（config/onebot_<号>.json）、各自的 accessToken 都不一样，"
+                        f"而它只会挂电脑上当前登录的那个 QQ。"
+                        f"先确认 QQ 里登录的是机器人号（配置里 self_id={self.self_id or '未填'}），"
+                        f"再重启网关")
+            return f"网关拒绝了握手（HTTP {exc.status}）"
+        return str(exc)
 
     def stop(self) -> None:
         self._stop.set()

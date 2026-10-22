@@ -58,10 +58,10 @@ def _print_accounts(cfg: dict, roster: list[dict]) -> int:
           + ("（单账号 = 顶层 onebot.* / persona.*）" if not (cfg.get("accounts") or []) else ""))
     for index, row in enumerate(rows):
         persona = row.get("persona") or str(((cfg.get("persona") or {}).get("character_id")) or "")
-        who = names.get(persona, persona) or "（没填 → 用名册第一个人，启动时会提醒）"
+        who = "群聊（按小窝当前在场成员）" if persona == "group" else names.get(persona, persona) or "（没填 → 用名册第一个人，启动时会提醒）"
         print(f"  {index + 1}. {row.get('name')} · QQ {row.get('self_id') or '(连上后问网关)'} "
               f"· 端口 {row.get('listen_port') or '(顶层)'} · 演 {who}")
-        if persona and roster and persona not in names:
+        if persona and persona != "group" and roster and persona not in names:
             print(f"     ✗ 名册里没有 `{persona}` 这个人 —— 大脑会 404，填角色介绍里的 id。")
             problems += 1
     return problems
